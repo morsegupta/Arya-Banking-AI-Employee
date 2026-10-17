@@ -1,0 +1,13 @@
+name: sharma_distributors
+display_name: Sharma Distributors Pvt Ltd
+mode: owner                      # owner | embedded (architecture §8.1)
+
+channels:
+  hub_url: http://127.0.0.1:8103
+  hub_token: vault://HUB_ARYA_TOKEN
+  email_from: ar@sharma-distributors.example
+  whatsapp_from: "+91-90000-00000"
+  signature: "Arya · Accounts Receivable · Sharma Distributors"
+
+files:
+  drive_root: var/drive          # shared drive mount

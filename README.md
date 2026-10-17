@@ -17,10 +17,29 @@ All four are seeded from one world file: [evals/worlds/sharma_default.yaml](eval
 (15 customers, 25 invoices, 10 prior bank transactions, sandbox date Monday 2026-10-19).
 Customer personas in that file are ground truth for the simulator and evals; they are never written into any system.
 
+## Runtime foundations (Day 1 midday)
+
+| Module | What it does |
+|---|---|
+| `core/models.py` | Typed, domain-free contracts: Mission, Entity, Task, Event, ToolResult, reports |
+| `core/events.py` | Append-only, hash-chained event store with dedupe keys; in-process bus |
+| `core/scheduler.py` | Durable timers in SQLite, exactly-once firing, survive restarts |
+| `tools/base.py` | Tool interface + registry: capability scope, policy hook, idempotency ledger, retry/backoff, verify, secret scrubbing. Money-moving tools cannot register |
+| `tools/browser.py` | Playwright driver: per-task context, ref-based snapshots, vault logins, network guard (bank is GET-only), session-expiry recovery |
+| `tools/channels/hub.py` | email / WhatsApp / call tools; sends deduped end to end via idempotency keys; bounces surface as permanent errors |
+| `tools/files.py` | PDF / text / CSV / XLSX readers confined to the drive and the task's own files |
+| `packs/companies/sharma_distributors/` | Company pack: channel identity and app maps (no secrets, only `vault://` refs) |
+
+`tests/test_domain_free.py` fails the build if `core/` mentions the collections domain.
+
 ## Run
 
 ```bash
 uv sync
+```
+
+```bash
+uv run playwright install chromium
 ```
 
 ```bash

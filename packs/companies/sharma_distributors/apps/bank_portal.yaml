@@ -1,0 +1,17 @@
+name: bank_portal
+title: Bharat Commerce Bank — corporate net-banking (web only, no API)
+base_url: http://127.0.0.1:8102
+read_only: true                     # view and download only. Enforced at the network layer.
+login:
+  path: /login
+  fields:
+    User ID: vault://BANK_USER_ID
+    Password: vault://BANK_PASSWORD
+  submit: Login
+logout_path: /logout
+allowed_post_paths: [/login, /logout]
+deny_paths: [/transfer, /_sandbox]
+notes:
+  - Statements live under "Account statement"; set From/To dates then "View statement".
+  - CSV download link is on the statement page; it covers the selected date range.
+  - Sessions expire after about 5 minutes.
