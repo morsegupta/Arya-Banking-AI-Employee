@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Mini ERP{% endblock %} — Sharma Distributors</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9; color: #1d2330; }
+  header { background: #1f3a5f; color: #fff; padding: 10px 20px; display: flex; gap: 24px; align-items: center; }
+  header a { color: #fff; text-decoration: none; }
+  header .brand { font-weight: 700; }
+  header form { margin-left: auto; }
+  main { padding: 20px; max-width: 1100px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border: 1px solid #d9dde3; padding: 6px 8px; text-align: left; font-size: 14px; }
+  th { background: #eef1f5; }
+  td.num, th.num { text-align: right; }
+  .flash { background: #e3f6e8; border: 1px solid #8bc79b; padding: 8px 12px; margin-bottom: 12px; }
+  .error { background: #fdeaea; border: 1px solid #e19a9a; padding: 8px 12px; margin-bottom: 12px; }
+  .badge { padding: 1px 6px; border-radius: 4px; font-size: 12px; background: #e5e8ee; }
+  .badge.DISPUTED, .badge.legal { background: #fbe3c8; }
+  .badge.PAID { background: #d6f0dc; }
+  form.inline { display: inline; }
+  label { display: block; margin-top: 8px; font-size: 14px; }
+  input, select { padding: 4px; }
+  button { padding: 5px 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">Sharma Distributors · Mini ERP</span>
+  {% if user %}
+  <nav aria-label="Main">
+    <a href="/">Dashboard</a> ·
+    <a href="/customers">Customers</a> ·
+    <a href="/invoices">Invoices</a> ·
+    <a href="/receipts">Receipts</a>
+  </nav>
+  <form method="post" action="/logout"><span>{{ user }}</span> <button type="submit">Log out</button></form>
+  {% endif %}
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

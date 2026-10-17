@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ inv.number }}{% endblock %}
+{% block content %}
+{% if posted %}<p class="flash" role="status">Receipt {{ posted }} posted.</p>{% endif %}
+<h1>Invoice {{ inv.number }}</h1>
+<dl>
+  <dt>Customer</dt><dd><a href="/customers/{{ inv.customer_id }}">{{ inv.customer_name }}</a> ({{ inv.customer_id }})</dd>
+  <dt>Issue date</dt><dd>{{ inv.issue_date }}</dd>
+  <dt>Due date</dt><dd>{{ inv.due_date }}</dd>
+  <dt>Days overdue</dt><dd id="days-overdue">{{ inv.days_overdue if inv.days_overdue > 0 else 0 }}</dd>
+  <dt>Status</dt><dd id="status"><span class="badge {{ inv.status }}">{{ inv.status }}</span></dd>
+  {% if inv.dispute_note %}<dt>Dispute</dt><dd>{{ inv.dispute_note }}</dd>{% endif %}
+  <dt>Total</dt><dd id="total">{{ inv.total_paise|inr }}</dd>
+  <dt>Balance due</dt><dd id="balance">{{ inv.balance_paise|inr }}</dd>
+</dl>
+<p><a href="/invoices/{{ inv.number }}/pdf">Download invoice PDF</a></p>
+<h2>Line items</h2>
+<table aria-label="Line items">
+  <thead><tr><th>#</th><th>Description</th><th>HSN</th><th class="num">Qty</th><th>Unit</th><th class="num">Rate</th><th class="num">Amount</th></tr></thead>
+  <tbody>
+  {% for l in inv.lines %}
+    <tr><td>{{ l.line_no }}</td><td>{{ l.description }}</td><td>{{ l.hsn }}</td><td class="num">{{ l.qty }}</td><td>{{ l.unit }}</td><td class="num">{{ l.rate_paise|inr }}</td><td class="num">{{ l.amount_paise|inr }}</td></tr>
+  {% endfor %}
+    <tr><td colspan="6">Taxable value</td><td class="num">{{ inv.taxable_paise|inr }}</td></tr>
+    <tr><td colspan="6">GST @ 18%</td><td class="num">{{ inv.gst_paise|inr }}</td></tr>
+    <tr><th colspan="6">Invoice total</th><th class="num">{{ inv.total_paise|inr }}</th></tr>
+  </tbody>
+</table>
+<h2>Receipts</h2>
+<table aria-label="Receipts">
+  <thead><tr><th>Receipt</th><th>Date</th><th>Mode</th><th>Reference</th><th class="num">Amount</th><th>Posted by</th></tr></thead>
+  <tbody>
+  {% for r in inv.receipts %}
+    <tr><td>{{ r.id }}</td><td>{{ r.receipt_date }}</td><td>{{ r.mode }}</td><td>{{ r.reference }}</td><td class="num">{{ r.amount_paise|inr }}</td><td>{{ r.posted_by }}</td></tr>
+  {% else %}
+    <tr><td colspan="6">No receipts posted.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if inv.status in ("OPEN", "PARTIALLY_PAID") %}
+<p><a href="/invoices/{{ inv.number }}/receipts/new">Record receipt</a></p>
+{% endif %}
+{% endblock %}

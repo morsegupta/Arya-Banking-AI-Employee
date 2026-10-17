@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Customers{% endblock %}
+{% block content %}
+<h1>Customers</h1>
+<table aria-label="Customers">
+  <thead><tr><th>ID</th><th>Name</th><th>City</th><th>Terms</th><th>AP contact</th><th>Flags</th><th class="num">Outstanding</th></tr></thead>
+  <tbody>
+  {% for c in customers %}
+    <tr>
+      <td>{{ c.id }}</td>
+      <td><a href="/customers/{{ c.id }}">{{ c.name }}</a></td>
+      <td>{{ c.city }}</td>
+      <td>Net {{ c.payment_terms_days }}</td>
+      <td>{{ c.contact_name }}</td>
+      <td>{% if c.payment_plan %}<span class="badge">Payment plan</span>{% endif %}{% if c.legal_hold %}<span class="badge legal">Legal hold</span>{% endif %}</td>
+      <td class="num">{{ c.outstanding_paise|inr }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

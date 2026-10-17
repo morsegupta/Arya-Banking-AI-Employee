@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}NetBanking{% endblock %} — Bharat Commerce Bank</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; background: #f2f4f2; color: #222; }
+  header { background: #0b5e3b; color: #fff; padding: 10px 20px; display: flex; gap: 20px; align-items: center; }
+  header a { color: #fff; }
+  header .brand { font-weight: 700; font-size: 18px; }
+  header form { margin-left: auto; }
+  main { padding: 20px; max-width: 1100px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border: 1px solid #ccd5cf; padding: 5px 8px; font-size: 13px; text-align: left; }
+  th { background: #e4ece6; }
+  td.num, th.num { text-align: right; }
+  .alert { background: #fff4d6; border: 1px solid #e0c46c; padding: 8px 12px; margin-bottom: 12px; }
+  .error { background: #fdeaea; border: 1px solid #e19a9a; padding: 8px 12px; margin-bottom: 12px; }
+  label { display: block; margin-top: 8px; font-size: 14px; }
+  input { padding: 4px; }
+  button { padding: 5px 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">Bharat Commerce Bank · Corporate NetBanking</span>
+  {% if user %}
+  <nav aria-label="Main">
+    <a href="/">Account summary</a> ·
+    <a href="/statement">Account statement</a> ·
+    <a href="/transfer">Fund transfer</a>
+  </nav>
+  <form method="post" action="/logout"><span>{{ user }} (View only)</span> <button type="submit">Logout</button></form>
+  {% endif %}
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

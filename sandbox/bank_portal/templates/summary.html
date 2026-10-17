@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Account summary{% endblock %}
+{% block content %}
+<h1>Account summary</h1>
+<dl>
+  <dt>Account name</dt><dd>{{ acct.account_name }}</dd>
+  <dt>Account number</dt><dd>{{ acct.account_number }}</dd>
+  <dt>IFSC</dt><dd>{{ acct.ifsc }}</dd>
+  <dt>Branch</dt><dd>{{ acct.branch }}</dd>
+  <dt>Available balance as of {{ today.isoformat() }}</dt><dd id="balance">{{ acct.balance_paise|inr }}</dd>
+</dl>
+<h2>Last 5 transactions</h2>
+{% set rows = recent %}
+{% include "_txn_table.html" %}
+<p><a href="/statement">View full account statement</a></p>
+{% endblock %}

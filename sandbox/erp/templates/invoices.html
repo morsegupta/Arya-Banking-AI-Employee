@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Invoices{% endblock %}
+{% block content %}
+<h1>Invoices</h1>
+<form method="get" action="/invoices" aria-label="Filter invoices">
+  <label for="status">Status (comma separated)</label>
+  <input id="status" name="status" value="{{ filters.status }}" placeholder="OPEN,PARTIALLY_PAID">
+  <label for="min_days">Minimum days overdue</label>
+  <input id="min_days" name="min_days" value="{{ filters.min_days }}" inputmode="numeric">
+  <label for="customer">Customer</label>
+  <select id="customer" name="customer">
+    <option value="">All customers</option>
+    {% for c in customers %}<option value="{{ c.id }}" {% if c.id == filters.customer %}selected{% endif %}>{{ c.id }} — {{ c.name }}</option>{% endfor %}
+  </select>
+  <p><button type="submit">Apply filters</button></p>
+</form>
+<p>{{ total_rows }} invoices · page {{ page }} of {{ pages }}</p>
+{% include "_invoice_table.html" %}
+<nav aria-label="Pagination">
+  {% set qs = "status=" ~ filters.status ~ "&min_days=" ~ filters.min_days ~ "&customer=" ~ filters.customer %}
+  {% if page > 1 %}<a href="/invoices?{{ qs }}&page={{ page - 1 }}">Previous page</a>{% endif %}
+  {% if page < pages %}<a href="/invoices?{{ qs }}&page={{ page + 1 }}">Next page</a>{% endif %}
+</nav>
+{% endblock %}

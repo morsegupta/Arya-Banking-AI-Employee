@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Message Hub — sandbox observer</title>
+<meta http-equiv="refresh" content="10">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; background: #fafafa; color: #222; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border: 1px solid #ddd; padding: 5px 8px; font-size: 13px; text-align: left; vertical-align: top; }
+  th { background: #eee; }
+  .bounced, .failed { color: #a32020; }
+  pre { white-space: pre-wrap; margin: 0; font-family: inherit; }
+</style>
+</head>
+<body>
+<h1>Message Hub — sandbox observer</h1>
+<p>All email and WhatsApp traffic in the sandbox, newest first. For humans watching the demo; the agent uses the API.</p>
+<table aria-label="Messages">
+  <thead><tr><th>Sent (sim time)</th><th>Channel</th><th>From</th><th>To</th><th>Subject / body</th><th>Attachments</th><th>Status</th><th>Thread</th></tr></thead>
+  <tbody>
+  {% for m in messages %}
+    <tr>
+      <td>{{ m.sent_at }}</td><td>{{ m.channel }}</td><td>{{ m.from_addr }}</td><td>{{ m.to_addr }}</td>
+      <td>{% if m.subject %}<strong>{{ m.subject }}</strong><br>{% endif %}<pre>{{ m.body }}</pre></td>
+      <td>{% for a in m.attachments %}{{ a.filename }}<br>{% endfor %}</td>
+      <td class="{{ m.status }}">{{ m.status }}{% if m.status_detail %}<br>{{ m.status_detail }}{% endif %}</td>
+      <td>{{ m.thread_id }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="8">No messages yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<h2>Call requests</h2>
+<table aria-label="Calls">
+  <thead><tr><th>ID</th><th>From</th><th>To</th><th>Purpose</th><th>Status</th><th>Transcript</th></tr></thead>
+  <tbody>
+  {% for c in calls %}
+    <tr><td>{{ c.id }}</td><td>{{ c.from_addr }}</td><td>{{ c.to_addr }}</td><td>{{ c.purpose }}</td><td>{{ c.status }}</td><td><pre>{{ c.transcript or "" }}</pre></td></tr>
+  {% else %}
+    <tr><td colspan="6">No calls requested.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</body>
+</html>

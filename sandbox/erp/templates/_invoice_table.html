@@ -1,0 +1,19 @@
+<table aria-label="Invoices">
+  <thead><tr><th>Invoice</th><th>Customer</th><th>Issued</th><th>Due</th><th class="num">Days overdue</th><th class="num">Total</th><th class="num">Balance</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for i in invoices %}
+    <tr>
+      <td><a href="/invoices/{{ i.number }}">{{ i.number }}</a></td>
+      <td>{{ i.customer_name }}</td>
+      <td>{{ i.issue_date }}</td>
+      <td>{{ i.due_date }}</td>
+      <td class="num">{{ i.days_overdue if i.days_overdue > 0 else "—" }}</td>
+      <td class="num">{{ i.total_paise|inr }}</td>
+      <td class="num">{{ i.balance_paise|inr }}</td>
+      <td><span class="badge {{ i.status }}">{{ i.status }}</span></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="8">No invoices match.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>

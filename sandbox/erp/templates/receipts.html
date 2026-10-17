@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Receipts{% endblock %}
+{% block content %}
+<h1>Receipts</h1>
+<table aria-label="Receipts">
+  <thead><tr><th>Receipt</th><th>Invoice</th><th>Customer</th><th>Date</th><th>Mode</th><th>Reference</th><th class="num">Amount</th><th>Posted by</th></tr></thead>
+  <tbody>
+  {% for r in receipts %}
+    <tr><td>{{ r.id }}</td><td><a href="/invoices/{{ r.invoice_number }}">{{ r.invoice_number }}</a></td><td>{{ r.customer_name }}</td><td>{{ r.receipt_date }}</td><td>{{ r.mode }}</td><td>{{ r.reference }}</td><td class="num">{{ r.amount_paise|inr }}</td><td>{{ r.posted_by }}</td></tr>
+  {% else %}
+    <tr><td colspan="8">No receipts yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Receivables dashboard</h1>
+<p>As of <strong id="as-of">{{ today.isoformat() }}</strong> · {{ open_count }} open invoices · Total outstanding <strong id="total-outstanding">{{ total_outstanding|inr }}</strong></p>
+<h2>Ageing (by days past due)</h2>
+<table aria-label="Ageing buckets">
+  <thead><tr><th>Bucket</th><th class="num">Outstanding</th></tr></thead>
+  <tbody>
+  {% for bucket, amount in buckets %}
+    <tr><td>{{ bucket }}</td><td class="num">{{ amount|inr }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p><a href="/invoices?status=OPEN,PARTIALLY_PAID&min_days=45">View invoices 45+ days overdue</a></p>
+{% endblock %}

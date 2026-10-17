@@ -1,0 +1,18 @@
+<table aria-label="Transactions">
+  <thead><tr><th>Date</th><th>Narration</th><th>Chq./Ref.No.</th><th>Value Dt</th><th class="num">Withdrawal Amt.</th><th class="num">Deposit Amt.</th><th class="num">Closing Balance</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.txn_date }}</td>
+      <td>{{ r.narration }}</td>
+      <td>{{ r.ref_no }}</td>
+      <td>{{ r.value_date }}</td>
+      <td class="num">{{ r.withdrawal_paise|inr if r.withdrawal_paise else "" }}</td>
+      <td class="num">{{ r.deposit_paise|inr if r.deposit_paise else "" }}</td>
+      <td class="num">{{ r.balance_paise|inr }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7">No transactions in this period.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>

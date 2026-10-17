@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Account statement{% endblock %}
+{% block content %}
+<h1>Account statement — {{ acct.account_number }}</h1>
+<form method="get" action="/statement" aria-label="Statement period">
+  <label for="from_date">From date</label>
+  <input id="from_date" name="from_date" type="date" value="{{ start.isoformat() }}">
+  <label for="to_date">To date</label>
+  <input id="to_date" name="to_date" type="date" value="{{ end.isoformat() }}">
+  <p><button type="submit">View statement</button></p>
+</form>
+<p>{{ total_rows }} transactions from {{ start.isoformat() }} to {{ end.isoformat() }} · page {{ page }} of {{ pages }}</p>
+<p>
+  <a href="/statement/download?format=csv&{{ range_qs }}">Download CSV</a> ·
+  <a href="/statement/download?format=pdf&{{ range_qs }}">Download PDF</a>
+</p>
+{% include "_txn_table.html" %}
+<nav aria-label="Pagination">
+  {% if page > 1 %}<a href="/statement?{{ range_qs }}&page={{ page - 1 }}">Previous page</a>{% endif %}
+  {% if page < pages %}<a href="/statement?{{ range_qs }}&page={{ page + 1 }}">Next page</a>{% endif %}
+</nav>
+{% endblock %}
