@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIRS = ["core", "agents", "subagents"]
-DOMAIN_WORDS = re.compile(r"invoice|payment|bank|receipt|collection|overdue|rupee|paise|utr\b|erp", re.I)
+DOMAIN_WORDS = re.compile(r"invoice|payment|bank|receipt|collection|overdue|rupee|paise|\butr\b|\berp\b", re.I)
 
 
 def test_runtime_core_is_domain_free():

@@ -10,4 +10,11 @@ channels:
   signature: "Arya · Accounts Receivable · Sharma Distributors"
 
 files:
-  drive_root: var/drive          # shared drive mount
+  drive_root: drive              # shared drive mount, relative to the sandbox data dir
+
+timezone: Asia/Kolkata
+
+connectors:
+  erp_api:
+    base_url: http://127.0.0.1:8101
+    api_key: vault://ERP_API_KEY

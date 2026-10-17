@@ -78,3 +78,32 @@ def ctx(tmp_path):
         return RunContext(mission_id="mis_test", task_id=task_id, allowed_apps=set(apps),
                           idempotency_key=key, artifacts_dir=tmp_path / "artifacts")
     return make
+
+
+# --- full runtime over the in-process sandbox ------------------------------------------------
+
+SANDBOX_SECRETS = {"HUB_ARYA_TOKEN": "hub-arya-token", "ERP_API_KEY": "erp-sandbox-readonly-key",
+                   "BANK_USER_ID": "SHARMA001", "BANK_PASSWORD": "bank-sandbox-pass",
+                   "ERP_WEB_USER": "ar.clerk", "ERP_WEB_PASSWORD": "erp-sandbox-pass"}
+
+
+@pytest.fixture()
+def asgi(sandbox_var):
+    import httpx
+
+    from sandbox.bank_portal.app import app as bank
+    from sandbox.erp.app import app as erp
+    from sandbox.message_hub.app import app as hub
+    return {"hub": httpx.ASGITransport(app=hub), "erp": httpx.ASGITransport(app=erp),
+            "bank": httpx.ASGITransport(app=bank)}
+
+
+@pytest.fixture()
+def make_runtime(sandbox_var, asgi):
+    from apps.runtime import build_runtime
+    from tools.vault import Vault
+
+    def make(llm):
+        return build_runtime(var_dir=sandbox_var, vault=Vault(SANDBOX_SECRETS), llm=llm,
+                             hub_transport=asgi["hub"], erp_transport=asgi["erp"])
+    return make

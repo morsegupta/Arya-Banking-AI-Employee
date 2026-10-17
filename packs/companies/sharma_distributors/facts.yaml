@@ -1,0 +1,10 @@
+# The only company facts the employee may state to customers (architecture §8.1).
+company_name: Sharma Distributors Pvt Ltd
+bank_account_name: Sharma Distributors Pvt Ltd
+bank_name: Bharat Commerce Bank
+bank_account_number: "50200012345678"
+bank_ifsc: BCBK0001234
+bank_branch: Peenya Industrial Area
+late_payment_interest: "1.5% per month on overdue amounts, as per the supply agreement"
+ar_email: ar@sharma-distributors.example
+ar_whatsapp: "+91-90000-00000"

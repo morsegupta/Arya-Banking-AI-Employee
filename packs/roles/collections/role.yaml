@@ -1,0 +1,106 @@
+# Role Pack: collections (Arya). Data, not code: the runtime reads this file.
+name: collections
+title: Accounts Receivable & Collections employee
+entity: invoice
+value_unit: paise                 # entity.value and money facts are integer paise
+
+pipeline:
+  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, PAID,
+           BROKEN_PROMISE, DISPUTED, NO_RESPONSE, ESCALATED, WRITTEN_OFF]
+  initial: [OVERDUE]
+  terminal: [PAID, WRITTEN_OFF]
+  constants:
+    tolerance: 100                # paise: bank vs ERP rounding allowed when matching
+    min_confidence: 0.8
+  timer_time_of_day: "10:00"
+  transitions:
+    - from: OVERDUE
+      to: CONTACTED
+      guard: { all: [ "outreach.delivered == true", "outreach.message_id exists" ] }
+
+    - from: CONTACTED
+      to: ACKNOWLEDGED
+      guard: { all: [ "classifier.about_entity == true", "evidence.quote exists" ] }
+
+    - from: [CONTACTED, ACKNOWLEDGED]
+      to: PROMISED
+      guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
+                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ] }
+
+    - from: ACKNOWLEDGED
+      to: DISPUTED
+      guard: { all: [ "classifier.intent == 'dispute'", "classifier.confidence >= min_confidence",
+                      "evidence.quote exists" ] }
+
+    # "Paid" needs money in the bank, matched to this invoice, and an ERP receipt, and the Verifier.
+    # A customer's claim alone can never satisfy this guard.
+    - from: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
+      to: PAID
+      guard: { all: [ "matcher.matched_amount >= entity.balance - tolerance", "matcher.payer_matches == true",
+                      "matcher.bank_txn_id exists", "erp.receipt_exists == true", "verifier.pass == true" ] }
+
+    - from: [PROMISED, CONTACTED, ACKNOWLEDGED]
+      to: PARTIALLY_PAID
+      guard: { all: [ "matcher.matched_amount > 0", "matcher.matched_amount < entity.balance - tolerance",
+                      "matcher.payer_matches == true", "erp.receipt_exists == true", "verifier.pass == true" ] }
+
+    - from: PARTIALLY_PAID
+      to: PROMISED
+      guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
+                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ] }
+
+    - from: PROMISED
+      to: BROKEN_PROMISE
+      actor: system
+      guard: "matcher.matched_amount == 0"
+
+    - from: CONTACTED
+      to: NO_RESPONSE
+      actor: system
+
+    - from: BROKEN_PROMISE
+      to: CONTACTED
+      guard: { all: [ "outreach.delivered == true", "outreach.message_id exists" ] }
+
+    - from: [ACKNOWLEDGED, DISPUTED, NO_RESPONSE, BROKEN_PROMISE]
+      to: ESCALATED
+
+    - from: ESCALATED
+      to: WRITTEN_OFF
+      actor: human
+
+timers:
+  - { on: CONTACTED, at: "entered_at + 3d", do: timer.followup_due, name: followup }
+  - { on: PROMISED,  at: "facts.promise_date - 1d", do: timer.promise_reminder_due, name: reminder }
+  - { on: PROMISED,  at: "facts.promise_date + 2d", do: timer.promise_check_due, name: check }
+
+task_types:
+  fetch_open_items:   { apps: [erp_api], goal: "List open invoices that match the mission scope" }
+  download_statement: { apps: [bank_portal, files], goal: "Download the bank statement CSV for a date range" }
+  outreach:           { apps: [email, whatsapp, files], goal: "Send a reminder for one invoice" }
+  post_receipt:       { apps: [erp_web], goal: "Record a matched payment against an invoice in the ERP" }
+
+# How an entity is loaded from the system of record, and what of it the employee may say.
+entity_source:
+  detail_tool: erp.get_invoice
+  detail_arg: number
+  external_ref: number
+  value: balance_paise
+  facts: [number, customer_id, customer_name, issue_date, due_date, days_overdue, total_paise, balance_paise, status]
+  money_facts: [total_paise, balance_paise]     # shown to the Conversation Agent formatted as ₹
+  documents: [pdf_path]                         # fields holding shared-drive paths
+  counterparty:
+    tool: erp.get_customer
+    arg: customer_id
+    from_fact: customer_id
+    name: contact_name
+    email: contact_email
+    whatsapp: contact_whatsapp
+
+outreach:
+  purpose: "First reminder for an overdue invoice: ask the customer for a payment date."
+  channel_order: [email, whatsapp]
+
+prompts:
+  operator: prompts/operator.md
+  conversation: prompts/conversation.md
