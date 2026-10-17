@@ -12,6 +12,7 @@ import argparse
 
 from sandbox.bank_portal import db as bank_db
 from sandbox.common import clock, config
+from sandbox.common.runlock import Busy, run_lock
 from sandbox.common.world import DEFAULT_WORLD, World, load_world
 from sandbox.drive.generate import generate
 from sandbox.erp import db as erp_db
@@ -39,7 +40,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--world", default=str(DEFAULT_WORLD))
     args = parser.parse_args()
-    summary = seed_all(load_world(args.world))
+    try:
+        with run_lock(config.var_dir(), "seed"):
+            summary = seed_all(load_world(args.world))
+    except Busy as exc:
+        raise SystemExit(f"refusing to re-seed: {exc}")
     for key, value in summary.items():
         print(f"{key:>18}: {value}")
 

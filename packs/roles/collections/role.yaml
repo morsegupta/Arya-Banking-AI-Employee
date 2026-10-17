@@ -36,13 +36,13 @@ pipeline:
     # A customer's claim alone can never satisfy this guard.
     - from: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
       to: PAID
-      guard: { all: [ "matcher.matched_amount >= entity.balance - tolerance", "matcher.payer_matches == true",
-                      "matcher.bank_txn_id exists", "erp.receipt_exists == true", "verifier.pass == true" ] }
+      guard: { all: [ "matcher.matched_amount >= entity.balance - tolerance", "matcher.counterparty_matches == true",
+                      "matcher.record_id exists", "erp.receipt_exists == true", "verifier.pass == true" ] }
 
     - from: [PROMISED, CONTACTED, ACKNOWLEDGED]
       to: PARTIALLY_PAID
       guard: { all: [ "matcher.matched_amount > 0", "matcher.matched_amount < entity.balance - tolerance",
-                      "matcher.payer_matches == true", "erp.receipt_exists == true", "verifier.pass == true" ] }
+                      "matcher.counterparty_matches == true", "erp.receipt_exists == true", "verifier.pass == true" ] }
 
     - from: PARTIALLY_PAID
       to: PROMISED
@@ -78,7 +78,14 @@ task_types:
   fetch_open_items:   { apps: [erp_api], goal: "List open invoices that match the mission scope" }
   download_statement: { apps: [bank_portal, files], goal: "Download the bank statement CSV for a date range" }
   outreach:           { apps: [email, whatsapp, files], goal: "Send a reminder for one invoice" }
-  post_receipt:       { apps: [erp_web], goal: "Record a matched payment against an invoice in the ERP" }
+  post_receipt:
+    apps: [erp_web]
+    goal: "Record a matched payment against an invoice in the ERP"
+    goal_template: >-
+      In the ERP web app, record a receipt against invoice {ref}: amount {amount}, receipt date {date},
+      payment mode {mode}, bank reference / UTR {reference}. Use the invoice's "Record receipt" form
+      (path /invoices/{ref}/receipts/new) and submit it once.
+    success_criteria: ["the ERP shows 'Receipt RCPT-... posted' on the invoice page"]
 
 # How an entity is loaded from the system of record, and what of it the employee may say.
 entity_source:
@@ -104,3 +111,23 @@ outreach:
 prompts:
   operator: prompts/operator.md
   conversation: prompts/conversation.md
+
+# Reply Classifier slot: the intents this role recognises in counterparty messages.
+reply_classifier:
+  minor_units: 100                # amounts in replies are rupees; entity values are paise
+  intents:
+    promise_to_pay: "commits to pay a stated amount on or by a stated date"
+    paid_claim: "says the payment has already been made"
+    dispute: "contests the invoice: quantity, price, quality or delivery"
+    doc_request: "asks for a copy of the invoice, statement or another document"
+    discount_request: "asks for a discount, waiver or better terms"
+    bank_detail_change: "asks to pay to different bank details, or says the supplier's details changed"
+    not_now: "acknowledges the message without any commitment"
+    opt_out: "asks the company to stop contacting them"
+    unclear: "none of the above, or cannot tell"
+
+# Matching money records (bank statement lines) to entities.
+reconciliation:
+  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
+  counterparty_field: customer_name
+  lookback_days: 21

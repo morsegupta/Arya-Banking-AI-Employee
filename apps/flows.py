@@ -120,13 +120,15 @@ class OutreachOutcome:
     attempts: list[str]
 
 
-async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str = "outreach1") -> OutreachOutcome:
-    """Draft and send one reminder, falling back across channels; move the entity to CONTACTED."""
+async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str = "outreach1",
+                   purpose: str | None = None, transition_to: str | None = "CONTACTED",
+                   extra_facts: dict[str, Any] | None = None) -> OutreachOutcome:
+    """Draft and send one message, falling back across channels; optionally move the entity."""
     cfg = role_cfg(rt)["outreach"]
     loaded = await load_entity(rt, mission_id, external_ref)
     agent = ConversationAgent(rt.llm, role_prompt=role_prompt(rt, "conversation"),
                               signature=rt.company_cfg["channels"].get("signature", ""))
-    facts, cfacts = conversation_facts(rt, loaded), company_facts(rt)
+    facts, cfacts = {**conversation_facts(rt, loaded), **(extra_facts or {})}, company_facts(rt)
     attempts: list[str] = []
     budget = Budget(40_000)
     for channel in cfg["channel_order"]:
@@ -135,7 +137,7 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str
             attempts.append(f"{channel}: no address")
             continue
         try:
-            turn = await agent.draft(channel=channel, to=to, purpose=cfg["purpose"], entity_facts=facts,
+            turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"], entity_facts=facts,
                                      company_facts=cfacts, documents=loaded.documents, budget=budget)
         except (DraftRejected, LLMError) as exc:
             attempts.append(f"{channel}: draft rejected: {exc}")
@@ -153,7 +155,9 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str
                 continue                     # L2 fallback: next channel
             break
         attempts.append(f"{channel}: delivered {res.output['id']}")
-        tr = rt.pipeline.propose(loaded.entity.id, "CONTACTED",
+        if transition_to is None:
+            return OutreachOutcome(True, channel, res.output, None, attempts)
+        tr = rt.pipeline.propose(loaded.entity.id, transition_to,
                                  {"outreach": {"delivered": True, "message_id": res.output["id"],
                                                "channel": channel, "thread_id": res.output["thread_id"]}},
                                  facts={"last_outreach": {"channel": channel, "message_id": res.output["id"],

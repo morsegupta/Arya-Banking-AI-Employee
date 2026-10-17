@@ -104,7 +104,9 @@ def build_runtime(*, role: str = "collections", company: str = "sharma_distribut
     pipeline = Pipeline(load_pipeline(role_dir / "role.yaml"), db, events, scheduler, clock, tz)
 
     if llm is None and use_llm:
-        llm = LLMClient.from_config(ROOT / "config" / "models.yaml", vault)
+        def say(model: str, seconds: float, reason: str) -> None:
+            print(f"  [llm] waiting {seconds:.0f}s for {model}: {reason[:160]}", flush=True)
+        llm = LLMClient.from_config(ROOT / "config" / "models.yaml", vault, on_wait=say)
 
     return Runtime(role=role, company=company, role_dir=role_dir, company_dir=company_dir, company_cfg=cfg,
                    db=db, events=events, bus=bus, clock=clock, scheduler=scheduler, vault=vault,

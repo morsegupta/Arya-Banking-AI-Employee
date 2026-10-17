@@ -137,8 +137,10 @@ def estimate_tokens(messages: list[dict], tools: list[dict] | None, max_tokens: 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, roles: dict[str, RoleConfig], *,
                  transport: httpx.AsyncBaseTransport | None = None, timeout: float = 120.0, max_attempts: int = 5,
-                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, clock: Callable[[], float] = time.monotonic):
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, clock: Callable[[], float] = time.monotonic,
+                 on_wait: Callable[[str, float, str], None] | None = None):
         self.roles = roles
+        self.on_wait = on_wait          # (model, seconds, reason): make throttling visible to operators
         self._http = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout, transport=transport,
                                        headers={"Authorization": f"Bearer {api_key}"})
         self.max_attempts, self._sleep, self._now = max_attempts, sleep, clock
@@ -205,7 +207,7 @@ class LLMClient:
         last_error = ""
         for attempt in range(1, self.max_attempts + 1):
             async with window.lock:  # one in-flight request per model keeps the header accounting honest
-                await self._wait_for_capacity(window, estimate)
+                await self._wait_for_capacity(model, window, estimate)
                 try:
                     resp = await self._http.post("/chat/completions", json=body)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -217,6 +219,7 @@ class LLMClient:
             if resp is not None and resp.status_code == 429:
                 wait = parse_duration(resp.headers.get("retry-after")) or 2.0 * attempt
                 last_error = f"429 rate limited: {resp.text[:200]}"
+                self._notify(model, wait, _error_body(resp).get("message", "429 rate limited"))
                 await self._sleep(wait + random.uniform(0, 0.5))
                 continue
             if resp is not None and resp.status_code < 500:
@@ -229,13 +232,19 @@ class LLMClient:
             await self._sleep(min(30.0, 1.0 * 2 ** (attempt - 1)) + random.uniform(0, 0.5))
         raise LLMError(f"{model} failed after {self.max_attempts} attempts: {last_error}")
 
-    async def _wait_for_capacity(self, w: _Window, estimate: int) -> None:
+    async def _wait_for_capacity(self, model: str, w: _Window, estimate: int) -> None:
         now = self._now()
         if w.remaining_requests is not None and w.remaining_requests <= 0 and w.requests_reset_at > now:
+            self._notify(model, w.requests_reset_at - now, "request quota used up")
             await self._sleep(w.requests_reset_at - now)
             now = self._now()
         if w.remaining_tokens is not None and w.remaining_tokens < estimate and w.tokens_reset_at > now:
+            self._notify(model, w.tokens_reset_at - now, f"token window: {w.remaining_tokens} left, need ~{estimate}")
             await self._sleep(w.tokens_reset_at - now)
+
+    def _notify(self, model: str, seconds: float, reason: str) -> None:
+        if self.on_wait and seconds >= 1:
+            self.on_wait(model, seconds, reason)
 
     def _update_window(self, w: _Window, headers: httpx.Headers) -> None:
         now = self._now()

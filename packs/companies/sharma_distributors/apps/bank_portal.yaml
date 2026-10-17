@@ -15,3 +15,9 @@ notes:
   - Statements live under "Account statement"; set From/To dates then "View statement".
   - CSV download link is on the statement page; it covers the selected date range.
   - Sessions expire after about 5 minutes.
+exports:
+  statement_csv:                    # column names seen in this bank's CSV; alternatives cover format changes
+    date:   { columns: ["Date", "Txn Date"], format: "%d/%m/%y" }
+    text:   { columns: ["Narration", "Description"] }
+    ref:    { columns: ["Chq./Ref.No.", "Reference"] }
+    credit: { columns: ["Deposit Amt.", "Credit"] }

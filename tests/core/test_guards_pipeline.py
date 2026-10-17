@@ -130,16 +130,16 @@ def test_customer_claim_alone_never_marks_paid(pipe):
 
 def test_paid_needs_match_receipt_and_verifier(pipe):
     e = contacted(pipe)
-    proof = {"matcher": {"matched_amount": 340000_00, "payer_matches": True, "bank_txn_id": "T1"},
+    proof = {"matcher": {"matched_amount": 340000_00, "counterparty_matches": True, "record_id": "T1"},
              "erp": {"receipt_exists": True}, "verifier": {"pass": True}}
     assert not pipe.propose(e.id, "PAID", {**proof, "verifier": {"pass": False}}).ok
-    assert not pipe.propose(e.id, "PAID", {**proof, "matcher": {**proof["matcher"], "payer_matches": False}}).ok
+    assert not pipe.propose(e.id, "PAID", {**proof, "matcher": {**proof["matcher"], "counterparty_matches": False}}).ok
     assert pipe.propose(e.id, "PAID", proof).ok
 
 
 def test_partial_payment(pipe):
     e = contacted(pipe)
-    proof = {"matcher": {"matched_amount": 170000_00, "payer_matches": True, "bank_txn_id": "T1"},
+    proof = {"matcher": {"matched_amount": 170000_00, "counterparty_matches": True, "record_id": "T1"},
              "erp": {"receipt_exists": True}, "verifier": {"pass": True}}
     assert not pipe.propose(e.id, "PAID", proof).ok
     assert pipe.propose(e.id, "PARTIALLY_PAID", proof).ok

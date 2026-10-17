@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import yaml
@@ -32,6 +33,7 @@ class AppMap(BaseModel):
     deny_paths: list[str] = Field(default_factory=list)          # never navigate/request these
     allowed_post_paths: list[str] = Field(default_factory=list)  # for read_only apps: the only non-GET requests allowed
     notes: list[str] = Field(default_factory=list)               # hints for the Operator (playbook seeds)
+    exports: dict[str, Any] = Field(default_factory=dict)         # how to read files this app produces
 
     @property
     def origin(self) -> str:

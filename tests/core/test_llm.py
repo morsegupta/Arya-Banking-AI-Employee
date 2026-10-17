@@ -130,3 +130,16 @@ def test_malformed_model_output_is_resampled_then_raised():
     with pytest.raises(ToolUseFailed) as exc:
         asyncio.run(client(fake, []).chat("operator", [{"role": "user", "content": "x"}]))
     assert "commentary" in exc.value.failed_generation
+
+
+def test_waits_are_reported():
+    seen = []
+
+    async def sleep(s):
+        pass
+    fake = Fake([httpx.Response(429, headers={"retry-after": "14m30s"},
+                                json={"error": {"message": "Rate limit reached ... tokens per day (TPD)"}}), ok("x")])
+    llm = LLMClient("https://llm.test/v1", "k", ROLES, transport=httpx.MockTransport(fake), sleep=sleep,
+                    on_wait=lambda m, s, r: seen.append((m, s, r)))
+    asyncio.run(llm.chat("light", [{"role": "user", "content": "x"}]))
+    assert seen == [("qwen/qwen3.8-27b", 870.0, "Rate limit reached ... tokens per day (TPD)")]
