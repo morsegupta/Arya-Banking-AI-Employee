@@ -44,6 +44,9 @@ def router(messages):
                              "approach": "firm_with_statement", "start_day": 0, "rationale": "deadline is close"}]}
     if "TASK: review" in system:
         return {"assessment": "On track.", "actions": []}
+    if "TASK: answer" in system:
+        return {"answer": f"About: {payload['QUESTION']}", "refs": ["INV-2270", "INV-9999"], "groups": ["C02", "ZZ"],
+                "confidence": 0.8}
     if "Conversation Agent" in system:
         email = payload["CHANNEL"] == "email"
         body = "Please share a payment date."

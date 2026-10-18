@@ -9,7 +9,7 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 2 afternoon complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 2 complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
 covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
 that commits the company waits in an approvals inbox; text that tries to instruct the AI is
@@ -26,7 +26,36 @@ quarantined before any agent reads it; and models never see account numbers, ema
 
 | Day 2 afternoon | Reliability ladder (playbooks → Operator → on-screen table → human), channel fallback on outages, Operator loop detection, persistent mission token budget with pause/resume, replan on failures, resume after kill (inbox, settlement), sandbox chaos switches |
 
-Next: Day 2 evening — workspace UI (Home, invoice board, timeline, approvals inbox, mission chat).
+| Day 2 evening | Workspace UI + API: Home (verified vs target), invoice board, per-invoice timeline / conversation / evidence, approvals inbox, mission chat, live activity; Scenario 1 runs from the browser |
+
+Next: Day 3 — scenarios 2, 3, 5, 6, memory, eval harness.
+
+## Workspace (Day 2 evening)
+
+Start the sandbox (`make sandbox`), then in a second terminal (needs Node 20+ for the first build):
+
+```bash
+make workspace
+```
+
+Open http://127.0.0.1:8100. Scenario 1 from the browser:
+
+1. Type your name top right (every decision records who made it).
+2. **Home**: give Arya the brief → it reads the policy, selects and ranks, drafts the day-0 messages.
+3. **Approvals**: read the plan and the exact first messages → Approve (or Reject with a note to redo them).
+4. **Home → Simulate a day** (sandbox only): customers act, Arya works, customers reply, Arya follows up, the clock moves.
+5. Watch **verified vs target** climb, the **Invoices** board move, open any invoice for its timeline, the real
+   email/WhatsApp thread and the evidence; decide concessions and quarantined messages in **Approvals**;
+   **Ask Arya** "who promised to pay this week?".
+
+| Piece | Where |
+|---|---|
+| API (FastAPI): reads as JSON, actions as background jobs (one at a time, same run lock as the CLI), live events over SSE | [apps/api.py](apps/api.py) |
+| UI (React + Vite + Tailwind), built into `apps/workspace/dist` and served by the API | [apps/workspace/](apps/workspace/) |
+| Mission chat: answers only from the mission's records; links to unknown invoices are dropped by code | `MissionAgent.answer`, `MissionRunner.chat` |
+
+UI development with hot reload: `uv run python -m apps.api` plus `cd apps/workspace && npm run dev`
+(http://127.0.0.1:5173, proxies `/api`).
 
 ## Reliability (Day 2 afternoon)
 
@@ -227,7 +256,8 @@ core/            role-agnostic runtime: models, events, scheduler, pipeline, mis
 agents/          primary agents: Mission, Operator, Conversation (domain-free)
 subagents/       Prioritizer, Reply Classifier, Matcher, Document Generator (domain-free)
 tools/           tool registry, browser driver, channels, files, ERP connector, vault, app maps
-apps/            runtime wiring, flows, settlement, orchestrator, mission runner, documents, CLI
+apps/            runtime wiring, flows, settlement, orchestrator, mission runner, documents, CLI, workspace API
+apps/workspace/  workspace UI (React + Vite + Tailwind)
 packs/roles/collections/            the job: pipeline, guards, timers, task types, prompts
 packs/companies/sharma_distributors/ the company: app maps, channels, facts it may state
 sandbox/         the fake company: ERP, bank portal, message hub, drive, customer simulator
@@ -303,7 +333,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-273 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+275 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -318,7 +348,8 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 2 evening+).** Workspace UI and API, eval harness, memory.
+- **Not built yet (Day 3).** Eval harness, memory, a second role pack.
+- The workspace has no login and binds to 127.0.0.1 only: a single-user prototype.
 - No vision (computer-use) driver: when the DOM route and the on-screen table both fail, the ladder ends
   with a human. `erp.layout=v2` is a test for the live Operator (LLM); scripted tests cannot adapt to it.
 - Resume covers the inbox and settlement; an Operator task killed mid-way is simply run again

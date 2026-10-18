@@ -458,6 +458,29 @@ class MissionRunner:
     FAILURE_EVENTS = ["task.failed", "fallback.exhausted", "mission.group_contacted", "settlement.receipt_task",
                       "policy.deny", "message.classification_failed"]
 
+    CHAT_EVENTS = ["entity.transitioned", "message.classified", "settlement.matched", "mission.group_contacted",
+                   "security.injection_suspected", "security.fraud_suspected", "approval.requested",
+                   "approval.decided", "mission.reviewed", "fallback.used", "fallback.exhausted"]
+
+    async def chat(self, question: str, *, by: str = "manager") -> dict[str, Any]:
+        """Mission chat: the Mission Agent answers from the mission's own state, with links."""
+        m = self.mission
+        refs = {e.id: e.external_ref for e in self.rt.pipeline.list(m.id)}
+        recent = []
+        for e in self.rt.events.query(mission_id=m.id, types=self.CHAT_EVENTS,
+                                      since_seq=max(0, self.rt.events.last_seq(mission_id=m.id) - 600)):
+            p = e.payload
+            recent.append({"at": e.occurred_at.strftime("%a %d %b %H:%M"), "type": e.type,
+                           "ref": refs.get(e.entity_id),
+                           **{k: p[k] for k in ("from", "to", "intent", "quote", "amount", "date", "record_id",
+                                                "group", "ok", "title", "status", "rung") if k in p}})
+        a = await self.agent.answer(question, m.spec, today=self._today(), progress=self.progress().as_dict(),
+                                    groups=self.group_rows(), recent_events=recent, budget=self.budget)
+        turn = {"at": self.rt.clock.now().isoformat(), "by": by, "question": question, **a.model_dump()}
+        self.store.update(m.id, data={"chat": [*m.data.get("chat", []), turn][-30:]}, event="mission.chat",
+                          payload={"question": question, "answer": a.answer, "refs": a.refs})
+        return turn
+
     def failures_since_review(self) -> list[dict[str, Any]]:
         """What went wrong since the agent last reviewed (L3 replan input). Successes are filtered out."""
         since = int(self.mission.data.get("reviewed_seq", 0))

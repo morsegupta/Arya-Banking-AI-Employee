@@ -93,6 +93,13 @@ class PlanProposal(BaseModel):
     human_asks: list[str] = Field(default_factory=list)
 
 
+class Answer(BaseModel):
+    answer: str
+    refs: list[str] = Field(default_factory=list)       # entity refs the answer is about
+    groups: list[str] = Field(default_factory=list)     # group ids the answer is about
+    confidence: float = Field(1.0, ge=0, le=1)
+
+
 class TickProposal(BaseModel):
     assessment: str
     actions: list[NextAction] = Field(default_factory=list)
@@ -102,6 +109,14 @@ _CASTS: dict[str, Callable[[Any], Any]] = {
     "integer": int, "string": str, "boolean": lambda v: v if isinstance(v, bool) else str(v).lower() == "true",
     "list": lambda v: list(v) if isinstance(v, (list, tuple)) else [v],
 }
+
+
+CHAT = """TASK: answer the manager's QUESTION about this mission.
+Use only SPEC, PROGRESS, GROUPS and RECENT_EVENTS. Values are in VALUE_UNIT: present them the way the
+role guidance says. If the data does not answer the question, say so plainly. Never promise actions:
+you report, the manager decides.
+Return: answer (2-6 sentences, plain text), refs (entity refs you mention), groups (group ids you
+mention), confidence (0..1)."""
 
 
 class MissionAgent:
@@ -235,6 +250,26 @@ class MissionAgent:
         batches.sort(key=lambda b: b.start_day)
         return MissionPlan(summary=p.summary, batches=batches, risks=p.risks, human_asks=p.human_asks,
                            problems=problems)
+
+    # --- chat ------------------------------------------------------------------------------
+
+    async def answer(self, question: str, spec: MissionSpec, *, today: date, progress: dict[str, Any],
+                     groups: list[dict[str, Any]], recent_events: list[dict[str, Any]],
+                     budget: Budget | None = None) -> Answer:
+        payload = {"SPEC": spec.model_dump(mode="json"), "TODAY": f"{today.isoformat()} ({today:%A})",
+                   "VALUE_UNIT": self.value_unit, "PROGRESS": progress, "GROUPS": groups,
+                   "RECENT_EVENTS": recent_events[-40:], "QUESTION": question[:1000]}
+        a = await self.llm.structured("mission", self._messages(CHAT, payload), Answer, budget=budget,
+                                      tag="mission:chat")
+        return self.check_answer(a, groups)
+
+    @staticmethod
+    def check_answer(a: Answer, groups: list[dict[str, Any]]) -> Answer:
+        """Links in an answer must point at real things: unknown refs and groups are dropped."""
+        known_refs = {i["ref"] for g in groups for i in g.get("items", [])}
+        known_groups = {g["group"] for g in groups}
+        return a.model_copy(update={"refs": [r for r in a.refs if r in known_refs],
+                                    "groups": [g for g in a.groups if g in known_groups]})
 
     # --- tick ------------------------------------------------------------------------------
 

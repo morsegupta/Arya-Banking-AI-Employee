@@ -1,4 +1,4 @@
-.PHONY: install seed sandbox test
+.PHONY: install seed sandbox test ui workspace
 
 install:
 	uv sync
@@ -11,3 +11,10 @@ sandbox: seed
 
 test:
 	uv run pytest
+
+ui:
+	cd apps/workspace && npm install --no-audit --no-fund && npm run build
+
+workspace:
+	@test -f apps/workspace/dist/index.html || $(MAKE) ui
+	uv run python -m apps.api

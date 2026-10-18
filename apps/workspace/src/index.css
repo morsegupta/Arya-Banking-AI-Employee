@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --color-ink: #0f172a;
+  --color-muted: #64748b;
+  --color-line: #e2e8f0;
+  --color-paper: #f8fafc;
+  --color-brand: #0f766e;
+  --color-brand-soft: #ccfbf1;
+}
+
+html, body, #root { height: 100%; }
+body { background: var(--color-paper); color: var(--color-ink); -webkit-font-smoothing: antialiased; }
+
+@utility card { @apply bg-white border border-line rounded-xl; }
+@utility pill { @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium; }
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition whitespace-nowrap;
+  &:disabled { @apply opacity-50 cursor-not-allowed; }
+}
+@utility btn-primary { @apply btn bg-brand text-white hover:bg-teal-800; }
+@utility btn-ghost { @apply btn border border-line bg-white hover:bg-slate-50; }
+@utility btn-danger { @apply btn border border-rose-200 bg-white text-rose-700 hover:bg-rose-50; }
+@utility label { @apply text-xs font-medium uppercase tracking-wide text-muted; }
+@utility input {
+  @apply w-full rounded-lg border border-line bg-white px-3 py-2 text-sm outline-none;
+  &:focus { @apply border-brand ring-2 ring-brand-soft; }
+}
