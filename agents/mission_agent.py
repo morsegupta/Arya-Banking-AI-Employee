@@ -121,8 +121,9 @@ mention), confidence (0..1)."""
 
 class MissionAgent:
     def __init__(self, llm: LLMClient, *, role_prompt: str = "", minor_units: int = 100,
-                 value_unit: str | None = None, tz: str = "UTC"):
+                 value_unit: str | None = None, tz: str = "UTC", plan_role: str = "mission"):
         self.llm, self.role_prompt, self.minor_units, self.value_unit = llm, role_prompt, minor_units, value_unit
+        self.plan_role = plan_role
         self.tz = ZoneInfo(tz)
 
     def _messages(self, task: str, payload: dict[str, Any], untrusted: str | None = None) -> list[dict[str, Any]]:
@@ -191,7 +192,7 @@ class MissionAgent:
                    budget: Budget | None = None) -> MissionPlan:
         payload = {"SPEC": spec.model_dump(mode="json"), "TODAY": f"{today.isoformat()} ({today:%A})",
                    "GROUPS": groups, "APPROACHES": approaches, "CAPACITY": capacity, "FORECAST": forecast or {}}
-        p = await self.llm.structured("mission", self._messages(PLAN, payload), PlanProposal,
+        p = await self.llm.structured(self.plan_role, self._messages(PLAN, payload), PlanProposal,
                                       budget=budget, tag="mission:plan")
         return self.check_plan(p, groups=groups, approaches=approaches, capacity=capacity,
                                max_day=(spec.deadline.date() - today).days if spec.deadline else None)

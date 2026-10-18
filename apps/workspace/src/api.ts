@@ -24,7 +24,8 @@ export type Mission = {
   selection: Record<string, unknown>;
   data: { excluded?: { ref: string; reason: string }[]; groups?: Record<string, { name: string; refs: string[]; score: number; suggested_approach: string }>;
     scope_value?: number; first_batch?: Record<string, Draft>; contacted_groups?: string[]; activated_on?: string;
-    chat?: ChatTurn[]; actions?: { date: string; lever: string; groups: string[]; result: string }[] };
+    chat?: ChatTurn[]; actions?: { date: string; lever: string; groups: string[]; result: string }[];
+    prepaid?: { ref: string; record_id: string; amount: number; kind: string }[] };
   progress: Progress | null; plan_text: string[]; budget: { used: number; max: number };
 };
 

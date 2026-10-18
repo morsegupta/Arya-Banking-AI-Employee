@@ -353,17 +353,32 @@ class BrowserDriver:
 
 
 class BrowserSessions:
-    """Owns Playwright; hands each task its own isolated driver."""
+    """Owns Playwright; hands each task its own isolated driver.
+
+    Playwright belongs to the event loop that started it. If the sessions are used from a new loop
+    (a later asyncio.run), the old browser is abandoned and a fresh one started, instead of awaiting
+    objects of a dead loop (which hangs)."""
 
     def __init__(self, apps: dict[str, AppMap], vault: Vault, *, headless: bool = True):
         self.apps, self.vault, self.headless = apps, vault, headless
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
         self._drivers: dict[str, BrowserDriver] = {}
-        self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock: asyncio.Lock | None = None
+
+    def _bind(self) -> bool:
+        """True if our Playwright lives on the running loop. Otherwise forget it and start over here."""
+        loop = asyncio.get_running_loop()
+        if self._loop is loop:
+            return True
+        self._drivers, self._browser, self._pw = {}, None, None     # the old loop's objects cannot be awaited
+        self._loop, self._lock = loop, asyncio.Lock()
+        return False
 
     async def driver(self, ctx: RunContext) -> BrowserDriver:
         key = ctx.task_id or "adhoc"
+        self._bind()
         async with self._lock:
             if key not in self._drivers:
                 if self._browser is None:
@@ -377,12 +392,16 @@ class BrowserSessions:
             return self._drivers[key]
 
     async def end_task(self, task_id: str) -> None:
+        if not self._bind():
+            return
         async with self._lock:
             driver = self._drivers.pop(task_id, None)
         if driver:
             await driver.close()
 
     async def shutdown(self) -> None:
+        if not self._bind():
+            return
         for task_id in list(self._drivers):
             await self.end_task(task_id)
         if self._browser:

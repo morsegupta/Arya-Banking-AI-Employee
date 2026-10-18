@@ -3,6 +3,9 @@
     open:       {path template}                       -> page snapshot
     download:   {link name}                           -> saved file path
     read_table: {table label, next: link name, max_pages}  -> header + rows across pages
+    fill:       {field label, value template}         -> types into the field
+    select:     {field label, value template}         -> picks a dropdown option
+    click:      {button name, expect: text}           -> clicks; fails unless `expect` appears on the result page
 
 A playbook is the cheapest, most predictable way to do a routine task. When the app changes
 and a step fails, the caller falls back to the Operator (an LLM that can adapt), and the
@@ -41,12 +44,13 @@ def _find(observation: dict[str, Any], name: str) -> dict[str, Any] | None:
 
 
 async def run_playbook(rt: Runtime, app: str, name: str, values: dict[str, Any], *, mission_id: str | None,
-                       task_id: str, entity_id: str | None = None) -> PlaybookResult:
+                       task_id: str, entity_id: str | None = None,
+                       write_scope: dict[str, list[dict[str, Any]]] | None = None) -> PlaybookResult:
     steps = load_app_maps(rt.company_dir / "apps")[app].playbooks.get(name)
     if not steps:
         return PlaybookResult(False, error=f"no playbook {name!r} for {app}")
     ctx = RunContext(mission_id=mission_id, task_id=task_id, entity_id=entity_id, allowed_apps={app},
-                     artifacts_dir=rt.artifacts_dir)
+                     artifacts_dir=rt.artifacts_dir, write_scope=write_scope or {})
     out = PlaybookResult(True)
     obs: dict[str, Any] = {}
 
@@ -78,6 +82,23 @@ async def run_playbook(rt: Runtime, app: str, name: str, values: dict[str, Any],
                     if nxt is None:
                         break
                     obs = await call("click", {"ref": nxt["ref"]})
+            elif "fill" in step or "select" in step:
+                action = "fill" if "fill" in step else "select"
+                field = _find(obs, step[action])
+                if field is None:
+                    raise PlaybookFailed(f"no field {step[action]!r} on {obs.get('url')}")
+                obs = await call(action, {"ref": field["ref"], "value": fill(str(step["value"]), values)})
+            elif "click" in step:
+                button = _find(obs, step["click"])
+                if button is None:
+                    raise PlaybookFailed(f"no {step['click']!r} on {obs.get('url')}")
+                ctx.idempotency_key = f"{task_id}:{step['click']}"   # a submit happens once, even if retried
+                obs = await call("click", {"ref": button["ref"]})
+                ctx.idempotency_key = None
+                page = " ".join([*obs.get("alerts", []), *obs.get("notices", []), obs.get("text", "")])
+                if step.get("expect") and step["expect"] not in page:
+                    raise PlaybookFailed(f"after {step['click']!r}: expected {step['expect']!r}, page says "
+                                         f"{(obs.get('alerts') or [page[:160]])}")
             else:
                 raise PlaybookFailed(f"unknown step {step}")
     except PlaybookFailed as exc:

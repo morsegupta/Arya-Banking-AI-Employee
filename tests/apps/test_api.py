@@ -51,7 +51,9 @@ def test_brief_to_first_day_through_the_api(client):
 
     m = c.get(f"/api/missions/{mid}").json()
     assert m["status"] == "AWAITING_PLAN_APPROVAL" and m["spec"]["target_value"] == 12_00_000_00
-    assert len(m["data"]["first_batch"]) == 6 and m["progress"]["verified"] == 0
+    # Mehta's payment is already in the bank: noticed before drafting, so no reminder is drafted for it
+    assert [x["ref"] for x in m["data"]["prepaid"]] == ["INV-2263"] and "C04" not in m["data"]["first_batch"]
+    assert len(m["data"]["first_batch"]) == 5 and m["progress"]["verified"] == 0
     board = c.get(f"/api/missions/{mid}/board").json()
     assert len(board["entities"]) == 15 and {e["state"] for e in board["entities"]} == {"OVERDUE"}
 

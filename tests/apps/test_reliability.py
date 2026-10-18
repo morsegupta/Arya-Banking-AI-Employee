@@ -230,3 +230,38 @@ def test_failures_trigger_a_replan(runtime):
         await r.tick()                                       # nothing new since: no extra review
         assert len(reviews) == 1
     drive(rt, body=body)
+
+
+def operator_for_new_receipt_form(messages):
+    """An Operator that reads the changed (v2) receipt form by its new labels."""
+    from tests.apps.test_mission_week import _ref
+    if not messages[0]["content"].startswith("You are the Operator") or "record a receipt" not in messages[1]["content"]:
+        return week_llm(messages)
+    import re
+    goal = json.loads(messages[1]["content"])["task"]
+    ref, amount, utr = re.search(r"invoice (INV-\d+): amount ([\d.]+),.*UTR (\w+)", goal).groups()
+    step = sum(1 for m in messages if m["role"] == "assistant")
+    steps = [lambda: ("erp_web__open", {"path": f"/invoices/{ref}/receipts/new"}),
+             lambda: ("erp_web__fill", {"ref": _ref(messages, "UTR / Reference no."), "value": utr}),
+             lambda: ("erp_web__fill", {"ref": _ref(messages, "Received amount"), "value": amount}),
+             lambda: ("erp_web__click", {"ref": _ref(messages, "Save receipt")}),
+             lambda: ("finish_task", {"summary": "posted", "result_call_ids": ["v2-3"]})]
+    name, args = steps[step]()
+    return LLMResponse(None, [call(name, args, f"v2-{step}")], {"total_tokens": 300})
+
+
+def test_changed_erp_form_falls_back_to_the_operator(runtime, servers):  # noqa: F811
+    chaos.set_switches(**{"erp.layout": "v2"})
+    rt = runtime([operator_for_new_receipt_form] * 50)
+    drive(rt, body=lambda: sync_one(rt))
+    assert state(rt, "INV-2263") == "PAID"
+    routes = [e.payload.get("route") for e in rt.events.query(types=["settlement.receipt_task"])]
+    assert routes == ["playbook", "operator"]
+    used = rt.events.query(types=["fallback.used"])
+    assert used and used[-1].payload["what"] == "post receipt" and "no field" in used[-1].payload["attempts"][0]
+
+
+def test_receipt_playbook_uses_no_llm(runtime):
+    rt = runtime([])                                         # any LLM call would fail the test
+    drive(rt, body=lambda: sync_one(rt))
+    assert state(rt, "INV-2263") == "PAID" and rt.llm.seen == []

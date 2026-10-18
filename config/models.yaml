@@ -6,6 +6,9 @@ provider:
 
 roles:
   mission:      { model: openai/gpt-oss-120b, reasoning_effort: high,   max_tokens: 4000 }
+  # Planning writes a long JSON plan: medium reasoning leaves room for it under the output cap
+  # (high reasoning used the whole 4000-token cap live and the JSON never came). Code validates plans.
+  mission_plan: { model: openai/gpt-oss-120b, reasoning_effort: medium, max_tokens: 5500 }
   verifier:     { model: openai/gpt-oss-120b, reasoning_effort: high,   max_tokens: 3000 }
   operator:     { model: openai/gpt-oss-120b, reasoning_effort: medium, max_tokens: 2000 }
   conversation: { model: openai/gpt-oss-120b, reasoning_effort: medium, max_tokens: 2000 }

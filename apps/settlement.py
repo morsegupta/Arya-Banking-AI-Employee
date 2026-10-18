@@ -236,21 +236,37 @@ async def receipts_for(rt: Runtime, mission_id: str, ref: str) -> list[dict]:
 async def post_receipt(rt: Runtime, mission_id: str, entity: Entity, m: Match) -> dict | None:
     """Ask the Operator to post the receipt in the ERP web UI, unless it already exists. Returns the receipt."""
     existing = [r for r in await receipts_for(rt, mission_id, entity.external_ref) if r["reference"] == m.record_id]
+    if existing:
+        return existing[0]
+    values = {"ref": entity.external_ref, "amount": f"{m.matched_amount / 100:.2f}", "date": m.record_on.isoformat(),
+              "reference": m.record_id, "mode": _mode(m.record_text)}
+    # The task may submit exactly this receipt: the matcher's amount and bank reference, nothing else.
+    scope = {"erp_web": [{"method": "POST", "path": f"/invoices/{entity.external_ref}/receipts",
+                          "form": {"amount": values["amount"], "reference": m.record_id}}]}
+    # 1. scripted playbook (no LLM)
+    pb = await run_playbook(rt, "erp_web", "post_receipt", values, mission_id=mission_id, entity_id=entity.id,
+                            task_id=f"pb-receipt-{entity.id}-{m.record_id}", write_scope=scope)
+    existing = [r for r in await receipts_for(rt, mission_id, entity.external_ref) if r["reference"] == m.record_id]
+    rt.events.append(Event(type="settlement.receipt_task", mission_id=mission_id, entity_id=entity.id,
+                           occurred_at=rt.clock.now(),
+                           payload={"ok": bool(existing), "record_id": m.record_id, "route": "playbook",
+                                    "detail": pb.error or "posted"}))
     if not existing:
+        # 2. the Operator adapts to a changed form (same scoped write: it can only submit this receipt)
         spec = role_cfg(rt)["task_types"]["post_receipt"]
-        goal = spec["goal_template"].format(ref=entity.external_ref, amount=f"{m.matched_amount / 100:.2f}",
-                                            date=m.record_on.isoformat(), reference=m.record_id,
-                                            mode=_mode(m.record_text))
-        # The task may submit exactly this receipt: the matcher's amount and bank reference, nothing else.
-        scope = {"erp_web": [{"method": "POST", "path": f"/invoices/{entity.external_ref}/receipts",
-                              "form": {"amount": f"{m.matched_amount / 100:.2f}", "reference": m.record_id}}]}
+        goal = spec["goal_template"].format(**values)
         res = await run_task(rt, mission_id, "post_receipt", goal=goal, entity_id=entity.id,
-                             success_criteria=spec.get("success_criteria", []), write_scope=scope)
+                             success_criteria=spec.get("success_criteria", []), write_scope=scope,
+                             context={"why": f"the scripted receipt form failed: {pb.error}"})
+        existing = [r for r in await receipts_for(rt, mission_id, entity.external_ref) if r["reference"] == m.record_id]
         rt.events.append(Event(type="settlement.receipt_task", mission_id=mission_id, entity_id=entity.id,
                                occurred_at=rt.clock.now(),
-                               payload={"ok": not isinstance(res, FailureReport), "record_id": m.record_id,
+                               payload={"ok": bool(existing), "record_id": m.record_id, "route": "operator",
                                         "detail": res.error if isinstance(res, FailureReport) else res.summary}))
-        existing = [r for r in await receipts_for(rt, mission_id, entity.external_ref) if r["reference"] == m.record_id]
+        if existing:
+            rt.events.append(Event(type="fallback.used", mission_id=mission_id, entity_id=entity.id,
+                                   occurred_at=rt.clock.now(),
+                                   payload={"what": "post receipt", "rung": "operator", "attempts": [pb.error]}))
     return existing[0] if existing else None
 
 
@@ -399,6 +415,25 @@ async def _carry(rt: Runtime, mission_id: str, entity: Entity, m: Match, source:
                 subject=f"transition:{target}", mission_id=mission_id, entity_id=entity.id)
         rt.pipeline.update_data(entity.id, {"balance": max(0, balance - m.matched_amount)})
     return Settled(entity.external_ref, m, receipt, report, tr)
+
+
+async def peek_payments(rt: Runtime, mission_id: str) -> tuple[list[Match] | None, str]:
+    """Which entities already have money in the bank, without settling anything (no ledger, no receipts).
+    Scripted playbook only: if the bank cannot be read this cheaply, the answer is 'unknown' (None)."""
+    start, end = lookback(rt)
+    stamp = rt.clock.now().strftime("%Y%m%d%H%M%S")
+    pb = await run_playbook(rt, "bank_portal", "download_statement", {"start": start.isoformat(), "end": end.isoformat()},
+                            mission_id=mission_id, task_id=f"pb-peek-{stamp}")
+    if not (pb.ok and pb.files):
+        return None, f"bank not read: {pb.error}"
+    mapping = load_app_maps(rt.company_dir / "apps")["bank_portal"].exports["statement_csv"]
+    try:
+        records = parse_statement(pb.files[0], mapping)
+    except StatementFormatError as exc:
+        return None, f"statement not readable: {exc}"
+    tol = rt.pipeline.spec.constants.get("tolerance", 0)
+    return match(records, [c for _, c in candidates(rt, mission_id)], tolerance=tol,
+                 applied=ledger_applied(rt)), "ok"
 
 
 def lookback(rt: Runtime) -> tuple[date, date]:

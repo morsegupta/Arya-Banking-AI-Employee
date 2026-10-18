@@ -21,7 +21,7 @@ from agents.mission_agent import MissionAgent
 from apps.flows import _read, load_entity, outreach, role_cfg, role_prompt
 from apps.orchestrator import Orchestrator
 from apps.runtime import Runtime
-from apps.settlement import ensure_ledger, fresh_verified_total
+from apps.settlement import ensure_ledger, fresh_verified_total, peek_payments
 from core.guards import compile_guard, evaluate
 from core.injection import redacted
 from core.llm import Budget, LLMError
@@ -40,7 +40,9 @@ class MissionRunner:
         self.mcfg = self.cfg["mission"]
         self.agent = MissionAgent(rt.llm, role_prompt=role_prompt(rt, "mission"),
                                   minor_units=self.mcfg.get("minor_units", 100), value_unit=self.cfg.get("value_unit"),
-                                  tz=rt.company_cfg.get("timezone", "UTC"))
+                                  tz=rt.company_cfg.get("timezone", "UTC"),
+                                  plan_role="mission_plan" if rt.llm is not None and "mission_plan" in
+                                  getattr(rt.llm, "roles", {}) else "mission")
         self._budget = None
         self.log: list[str] = []
         self._orch: Orchestrator | None = None
@@ -194,8 +196,12 @@ class MissionRunner:
                                                    "expected_if_all_contacted": if_contacted.expected},
                                          budget=self.budget)
         except LLMError as exc:
-            self.store.update(m.id, event="mission.plan_failed", payload={"error": str(exc)[:500]})
-            self._say(f"planning failed, mission stays {m.status}: {str(exc)[:200]} (retry: mission plan)")
+            partial = getattr(exc, "failed_generation", "") or ""
+            self.store.update(m.id, event="mission.plan_failed",
+                              payload={"error": str(exc)[:500], "failed_generation": partial[:4000]})
+            self._say(f"planning failed, mission stays {m.status}: {str(exc)[:200]} (retry: mission plan)"
+                      + (f"\n    model output started: {partial[:300]!r} ({len(partial)} chars)" if partial
+                         else " — the model returned no output (likely cut off by the output cap)"))
             return self.mission
         plan.expected_value = if_contacted.expected
         if m.spec.target_value is not None and total < m.spec.target_value:
@@ -205,7 +211,9 @@ class MissionRunner:
             "groups": {g.id: {"name": g.name, "refs": [i.ref for i in g.items], "score": round(g.score, 3),
                               "suggested_approach": g.approach} for g in groups},
             "scope_value": total}, event="mission.planned", payload=plan.model_dump(mode="json"))
-        first = await self.draft_first_batch(plan) if self.first_batch_needs_approval() else {}
+        prepaid = await self.already_paid() if self.first_batch_needs_approval() else {}
+        first = await self.draft_first_batch(plan, skip=set(prepaid)) if self.first_batch_needs_approval() else {}
+        self.store.update(m.id, data={"prepaid": list(prepaid.values())})
         if first:
             self.store.update(m.id, plan=plan)               # draft problems are recorded on the plan
         self.store.transition(m.id, S.AWAITING_PLAN_APPROVAL, actor="agent", reason="plan ready")
@@ -231,14 +239,31 @@ class MissionRunner:
     def first_batch_needs_approval(self) -> bool:
         return bool(self.rt.policies.get("external_comm", {}).get("first_batch_requires_approval"))
 
-    async def draft_first_batch(self, plan: MissionPlan) -> dict[str, dict[str, Any]]:
-        """Draft the real day-0 messages (no sending) so the manager approves their exact wording."""
+    async def already_paid(self) -> dict[str, dict[str, Any]]:
+        """Entities whose money is already in the bank (matched, not yet settled): never chase them.
+        They are settled on the first run; here we only avoid drafting reminders to them."""
+        matches, note = await peek_payments(self.rt, self.mission_id)
+        if matches is None:
+            self._say(f"could not check the bank before drafting ({note}); drafting for every customer")
+            return {}
+        refs = {e.id: e.external_ref for e in self.rt.pipeline.list(self.mission_id)}
+        found = {m.entity_id: {"ref": refs[m.entity_id], "record_id": m.record_id, "amount": m.matched_amount,
+                               "kind": m.kind} for m in matches}
+        if found:
+            self._say("already paid in the bank, not drafting reminders: "
+                      + ", ".join(f"{v['ref']} ({v['record_id']})" for v in found.values()))
+        return found
+
+    async def draft_first_batch(self, plan: MissionPlan, skip: set[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Draft the real day-0 messages (no sending) so the manager approves their exact wording.
+        `skip`: entity ids whose payment is already in the bank."""
+        skip = skip or set()
         drafts: dict[str, dict[str, Any]] = {}
         feedback = self.mission.data.get("message_feedback", [])
         for batch in [b for b in plan.batches if b.start_day == 0]:
             spec = self.mcfg["approaches"][batch.approach]
             for gid in batch.groups:
-                ents = self._open_initial(gid)
+                ents = [e for e in self._open_initial(gid) if e.id not in skip]
                 if not ents:
                     continue
                 extra = []
@@ -600,6 +625,9 @@ def plan_text(m: Mission, fmt=str) -> list[str]:
             lines.append(f"  day {b.start_day}: {b.name} [{b.approach}] {names}")
             if b.rationale:
                 lines.append(f"         why: {b.rationale}")
+        for x in m.data.get("prepaid") or []:
+            lines.append(f"  already in the bank: {x['ref']} ({x['record_id']}, {fmt(x['amount'])}) — "
+                         "settled on the first run, not chased")
         first = m.data.get("first_batch") or {}
         if first:
             lines.append("  first-batch messages (sent exactly as approved):")

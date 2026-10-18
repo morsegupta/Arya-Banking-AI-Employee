@@ -60,6 +60,15 @@ export default function MissionView({ ctx }: { ctx: Ctx }) {
         </Section>
       )}
 
+      {(m.data.prepaid?.length ?? 0) > 0 && (
+        <Section title="Already paid in the bank (not chased)">
+          <ul className="text-sm space-y-1">
+            {m.data.prepaid!.map((x) => <li key={x.ref}><b className="font-mono">{x.ref}</b> — {inr(x.amount)} received ({x.record_id});
+              Arya records the receipt on its first run instead of sending a reminder</li>)}
+          </ul>
+        </Section>
+      )}
+
       {m.plan && (
         <Section title="Plan" right={<span className="text-xs text-muted">in scope {inr(m.data.scope_value)} · forecast if all contacted {inr(m.plan.expected_value)}</span>}>
           <p className="text-sm mb-4">{m.plan.summary}</p>

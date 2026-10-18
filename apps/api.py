@@ -219,7 +219,7 @@ def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Cal
         b = r.budget
         data = {k: v for k, v in m.data.items() if k in {"excluded", "groups", "scope_value", "first_batch",
                                                          "contacted_groups", "activated_on", "approved_by", "chat",
-                                                         "actions"}}
+                                                         "actions", "prepaid"}}
         return {"id": m.id, "brief": m.brief, "status": m.status, "created_at": m.created_at,
                 "spec": m.spec.model_dump(mode="json") if m.spec else None,
                 "plan": m.plan.model_dump(mode="json") if m.plan else None, "selection": m.selection, "data": data,

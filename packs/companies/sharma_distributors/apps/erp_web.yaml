@@ -14,3 +14,11 @@ scoped_writes: true                  # a task may only submit the exact receipt 
 notes:
   - Each invoice page has a "Record receipt" link while the invoice is open.
   - The receipt form needs date, amount, payment mode and bank reference / UTR.
+playbooks:                           # scripted, no LLM; the Operator is the fallback when the form changes
+  post_receipt:
+    - { open: "/invoices/{ref}/receipts/new" }
+    - { fill: "Receipt date", value: "{date}" }
+    - { fill: "Amount (₹)", value: "{amount}" }
+    - { select: "Payment mode", value: "{mode}" }
+    - { fill: "Bank reference / UTR", value: "{reference}" }
+    - { click: "Post receipt", expect: "Receipt RCPT-" }

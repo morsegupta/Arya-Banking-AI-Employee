@@ -72,8 +72,9 @@ def classify(messages):
 
 def test_invoice_goes_overdue_to_paid(servers, sandbox_var, asgi):  # noqa: F811
     # No reminder draft: the payment is reconciled before the reminder timer is handled.
-    # Statements come from the bank's scripted playbook (no LLM); the Operator only posts the receipt.
-    script = [DRAFT, classify, *RECEIPT_STEPS]
+    # Statement and receipt both go through scripted playbooks: the only LLM calls are the draft and
+    # reading the reply. (The Operator is the fallback, tested in test_reliability.py.)
+    script = [DRAFT, classify]
     llm = ScriptedLLM(script)
     rt = build_runtime(var_dir=sandbox_var, vault=Vault(SANDBOX_SECRETS), llm=llm,
                        hub_transport=asgi["hub"], erp_transport=asgi["erp"])
