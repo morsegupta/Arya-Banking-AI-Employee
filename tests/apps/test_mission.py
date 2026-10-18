@@ -159,6 +159,13 @@ def test_review_levers_are_executed_by_code(make_runtime, asgi):
         r.approve(by="test")
         r.orch._set_kv("last_sync", rt.clock.now().date().isoformat())
         asyncio.run(r.tick())
+        # day 0: the first email went out minutes ago, so a follow-up is too soon (cadence: 3 days)
+        decision = asyncio.run(r.review(r.progress()))
+        assert decision.actions == [] and any("contacted 0 day(s) ago" in p for p in decision.problems)
+        assert hub_inbox(asgi, "+919000010001") == []
+        from datetime import timedelta
+        from sandbox.common import clock
+        clock.advance(timedelta(days=3))                                  # Thursday: allowed now
         decision = asyncio.run(r.review(r.progress()))
         assert [a.lever for a in decision.actions] == ["follow_up"] and len(decision.problems) == 2
         assert r.mission.data["actions"][-1]["result"] == "C01: sent"

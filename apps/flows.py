@@ -250,6 +250,7 @@ def apply_sent(rt: Runtime, entities: list[Entity], sent: dict[str, Any], *, tra
                step: str) -> list[TransitionResult]:
     """After a message really went out: remember it on each entity and propose the transition."""
     transitions = []
+    sent = {**sent, "at": rt.clock.now().isoformat()}
     for e in entities:
         if transition_to is not None and transition_to in rt.pipeline.allowed_targets(rt.pipeline.get(e.id).state):
             transitions.append(rt.pipeline.propose(

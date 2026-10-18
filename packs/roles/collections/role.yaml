@@ -207,12 +207,15 @@ mission:
     follow_up:
       description: "Send a follow-up on the next channel to a customer who has not replied."
       states: [CONTACTED]
+      min_days_since_contact: 3
     send_statement:
       description: "Send the customer a statement of account of all their open invoices."
       states: [CONTACTED, ACKNOWLEDGED, BROKEN_PROMISE]
+      min_days_since_contact: 2
     re_engage:
       description: "Contact a customer again after a broken promise (once)."
       states: [BROKEN_PROMISE]
+      min_days_since_contact: 1
     escalate:
       description: "Hand the customer to a human (account manager) with the evidence so far."
       states: [ACKNOWLEDGED, DISPUTED, NO_RESPONSE, BROKEN_PROMISE]

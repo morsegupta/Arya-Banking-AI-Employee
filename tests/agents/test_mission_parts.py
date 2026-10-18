@@ -188,3 +188,14 @@ def test_mission_needs_human_approval_and_verified_money(runtime_db, events):
 def test_forecast_counts_verified_plus_weighted_open():
     p = progress(1000, 300, {"PROMISED": 400, "CONTACTED": 400}, {"PROMISED": 0.75, "CONTACTED": 0.25})
     assert (p.expected, p.gap, p.expected_shortfall) == (700, 700, 300)
+
+
+def test_follow_ups_respect_the_cadence():
+    groups = [{"group": "A", "states": ["CONTACTED"], "days_since_contact": 0},
+              {"group": "B", "states": ["CONTACTED"], "days_since_contact": 3},
+              {"group": "C", "states": ["CONTACTED"], "days_since_contact": None}]
+    levers = {"follow_up": {"states": ["CONTACTED"], "min_days_since_contact": 3}}
+    d = MissionAgent.check_tick(TickProposal(assessment="x", actions=[NextAction(lever="follow_up",
+                                                                                 groups=["A", "B", "C"])]),
+                                groups=groups, levers=levers)
+    assert d.actions[0].groups == ["B", "C"] and "contacted 0 day(s) ago" in d.problems[0]

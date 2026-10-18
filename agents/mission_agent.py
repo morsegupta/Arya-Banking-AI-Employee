@@ -10,7 +10,8 @@ checked by code before use:
 - plan(): only known groups and approaches; each group planned once; batches no
   bigger than the daily capacity; any group the model forgot is appended, so a
   plan always covers the whole scope. Corrections are listed in `problems`.
-- tick(): only the role pack's levers, only for groups in states the lever applies to.
+- tick(): only the role pack's levers, only for groups in states the lever applies to, and never
+  sooner after the last contact than the lever's cadence allows.
 
 Domain knowledge (what a lever means, what an approach is) arrives from the role pack.
 """
@@ -280,7 +281,10 @@ class MissionAgent:
                    budget: Budget | None = None) -> TickDecision:
         payload = {"SPEC": spec.model_dump(mode="json"), "TODAY": f"{today.isoformat()} ({today:%A})",
                    "PROGRESS": progress, "GROUPS": groups,
-                   "LEVERS": {k: v.get("description", "") for k, v in levers.items()},
+                   "LEVERS": {k: v.get("description", "") + (f" Only when the group's last contact was at least "
+                                                               f"{v['min_days_since_contact']} day(s) ago."
+                                                               if v.get("min_days_since_contact") else "")
+                              for k, v in levers.items()},
                    "RECENT_ACTIONS": recent_actions or [], "RECENT_FAILURES": recent_failures or []}
         p = await self.llm.structured("mission", self._messages(TICK, payload), TickProposal,
                                       budget=budget, tag="mission:tick")
@@ -290,6 +294,7 @@ class MissionAgent:
     def check_tick(p: TickProposal, *, groups: list[dict[str, Any]], levers: dict[str, dict[str, Any]]) -> TickDecision:
         problems: list[str] = []
         states = {g["group"]: set(g.get("states", [])) for g in groups}
+        since = {g["group"]: g.get("days_since_contact") for g in groups}
         actions: list[NextAction] = []
         for a in p.actions:
             lever = levers.get(a.lever)
@@ -303,6 +308,10 @@ class MissionAgent:
                     problems.append(f"{a.lever}: unknown group {g!r} dropped")
                 elif applies and not (states[g] & applies):
                     problems.append(f"{a.lever}: group {g} has no entity in {sorted(applies)}; dropped")
+                elif lever.get("min_days_since_contact") and since.get(g) is not None \
+                        and since[g] < lever["min_days_since_contact"]:
+                    problems.append(f"{a.lever}: group {g} was contacted {since[g]} day(s) ago (cadence needs "
+                                    f"{lever['min_days_since_contact']}); dropped")
                 else:
                     kept.append(g)
             if kept or not lever.get("needs_groups", True):

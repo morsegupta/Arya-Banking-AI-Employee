@@ -14,7 +14,7 @@ Collected value is read from the settlement ledger (matched, posted, verified), 
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from agents.mission_agent import MissionAgent
@@ -338,9 +338,13 @@ class MissionRunner:
                 f = e.data.get("facts", {})
                 items.append({"ref": e.external_ref, "state": e.state, "open": int(e.data.get("balance", e.value)),
                               **({"promise_date": f["promise_date"]} if f.get("promise_date") else {})})
+            contacts = [(e.data.get("last_contact") or {}).get("at") for e in ents]
+            last = max((c for c in contacts if c), default=None)
+            days = (self._today() - datetime.fromisoformat(last).date()).days if last else None
             rows.append({"group": gid, "name": names.get(gid, ""), "states": sorted({e.state for e in ents}),
                          "open_value": sum(i["open"] for i in items if i["state"] not in
-                                           self.rt.pipeline.spec.terminal), "items": items})
+                                           self.rt.pipeline.spec.terminal), "items": items,
+                         "days_since_contact": days})
         return sorted(rows, key=lambda r: -r["open_value"])
 
     # --- tick -------------------------------------------------------------------------------------------
