@@ -11,6 +11,7 @@
 
     python -m apps.cli mission new "Collect the 45+ day overdue invoices - target 12L by Friday"
     python -m apps.cli mission show | answer "<text>" | plan | approve | reject "<reason>" | tick | board
+    python -m apps.cli mission resume [--extra-tokens N]       after a pause (e.g. budget spent)
     python -m apps.cli mission run [--days 5] [--sim-llm]     tick daily with simulated customers
 
     python -m apps.cli approvals [list|show|approve|reject] [id] [--by name] [--note text]
@@ -276,6 +277,9 @@ async def cmd_mission(args) -> None:
             await runner.plan()
             _flush_runner(runner, 0)
             _show(runner)
+        elif args.action == "resume":
+            runner.resume(by=args.by, extra_tokens=args.extra_tokens)
+            _flush_runner(runner, 0)
         elif args.action == "tick":
             await runner.tick()
             _flush_runner(runner, 0)
@@ -390,12 +394,13 @@ def main(argv: list[str] | None = None) -> None:
     ev = sub.add_parser("events")
     ev.add_argument("-n", type=int, default=30)
     mi = sub.add_parser("mission")
-    mi.add_argument("action", choices=["new", "show", "board", "answer", "plan", "approve", "reject", "tick", "run"])
+    mi.add_argument("action", choices=["new", "show", "board", "answer", "plan", "approve", "reject", "tick", "run", "resume"])
     mi.add_argument("text", nargs="?", default="")
     mi.add_argument("--id", default=None)
     mi.add_argument("--by", default="finance_manager")
     mi.add_argument("--days", type=int, default=5)
     mi.add_argument("--sim-llm", action="store_true")
+    mi.add_argument("--extra-tokens", type=int, default=0, help="with resume: raise the mission's token budget")
     ap = sub.add_parser("approvals")
     ap.add_argument("action", nargs="?", default="list", choices=["list", "show", "approve", "reject"])
     ap.add_argument("id", nargs="?")

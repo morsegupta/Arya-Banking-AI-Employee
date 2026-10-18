@@ -21,7 +21,7 @@ from agents.mission_agent import MissionAgent
 from apps.flows import _read, load_entity, outreach, role_cfg, role_prompt
 from apps.orchestrator import Orchestrator
 from apps.runtime import Runtime
-from apps.settlement import LEDGER_SCHEMA, fresh_verified_total
+from apps.settlement import ensure_ledger, fresh_verified_total
 from core.guards import compile_guard, evaluate
 from core.injection import redacted
 from core.llm import Budget, LLMError
@@ -41,11 +41,17 @@ class MissionRunner:
         self.agent = MissionAgent(rt.llm, role_prompt=role_prompt(rt, "mission"),
                                   minor_units=self.mcfg.get("minor_units", 100), value_unit=self.cfg.get("value_unit"),
                                   tz=rt.company_cfg.get("timezone", "UTC"))
-        self.budget = Budget(200_000)
+        self._budget = None
         self.log: list[str] = []
         self._orch: Orchestrator | None = None
 
     # --- small helpers ---------------------------------------------------------------------
+
+    @property
+    def budget(self) -> Budget:
+        if self._budget is None or self._budget.key != f"mission:{self.mission_id}":
+            self._budget = self.rt.mission_budget(self.mission_id)
+        return self._budget
 
     @property
     def mission(self) -> Mission:
@@ -235,7 +241,7 @@ class MissionRunner:
     # --- progress -----------------------------------------------------------------------------------
 
     def verified_value(self) -> int:
-        self.rt.db.ensure_schema(LEDGER_SCHEMA)
+        ensure_ledger(self.rt)
         with self.rt.db.read() as conn:
             row = conn.execute("SELECT COALESCE(SUM(s.amount), 0) AS v FROM settlements s JOIN entities e "
                                "ON e.id = s.entity_id WHERE e.mission_id = ? AND s.status = 'VERIFIED'",
@@ -276,6 +282,9 @@ class MissionRunner:
         if m.status != S.ACTIVE:
             self._say(f"mission is {m.status}; nothing to do")
             return {"status": m.status}
+        budget = self.budget
+        if budget.used >= budget.max_tokens:
+            return self.pause_for_budget(budget)
         await self.orch.step()
         self.log += self.orch.log
         self.orch.log.clear()
@@ -296,8 +305,15 @@ class MissionRunner:
                 return {"status": S.COMPLETED, "progress": prog.as_dict(), "sent": sent}
             self._say(f"ledger says {prog.verified} but only {fresh} re-observed in the bank ({note}); not completed")
         decision = None
-        if self.mission.data.get("last_review") != self._today().isoformat() and self._worth_review():
-            decision = await self.review(prog)
+        failures = self.failures_since_review()
+        today = self._today().isoformat()
+        replans = self.mission.data.get("replans", {}).get(today, 0)
+        if self.mission.data.get("last_review") != today and self._worth_review():
+            decision = await self.review(prog, failures)
+        elif failures and replans < self.mcfg.get("max_replans_per_day", 2):
+            self._say(f"replanning after {len(failures)} failure(s)")
+            self.store.update(m.id, data={"replans": {today: replans + 1}})
+            decision = await self.review(prog, failures)
         deadline = m.spec.deadline if m.spec else None
         if deadline and self.rt.clock.now() > deadline:
             self.store.transition(m.id, S.ESCALATED, actor="system",
@@ -305,6 +321,24 @@ class MissionRunner:
             self._say("deadline passed below target: mission ESCALATED to the finance manager")
         return {"status": self.mission.status, "progress": prog.as_dict(), "sent": sent,
                 "decision": decision.model_dump() if decision else None}
+
+    def pause_for_budget(self, budget: Budget) -> dict[str, Any]:
+        self.store.transition(self.mission_id, S.PAUSED, actor="system",
+                              reason=f"token budget spent ({budget.used}/{budget.max_tokens})")
+        self.rt.approvals.request(
+            key=f"budget:{self.mission_id}:{budget.max_tokens}", kind="decision", mission_id=self.mission_id,
+            title=f"Mission paused: token budget spent ({budget.used:,}/{budget.max_tokens:,})",
+            payload={"action": "budget", "used": budget.used, "max": budget.max_tokens,
+                     "question": "Approve = resume with double the budget. Reject = keep it paused."})
+        self._say(f"token budget spent ({budget.used}/{budget.max_tokens}); mission PAUSED for a human")
+        return {"status": S.PAUSED}
+
+    def resume(self, *, by: str, extra_tokens: int = 0) -> Mission:
+        if extra_tokens:
+            self.budget.raise_limit(extra_tokens)
+        m = self.store.transition(self.mission_id, S.ACTIVE, actor="human", reason=f"resumed by {by}")
+        self._say(f"mission resumed by {by}")
+        return m
 
     def _worth_review(self) -> bool:
         """The agent reviews at most once a day, and only once there is something to review: a reply,
@@ -336,7 +370,7 @@ class MissionRunner:
                 sent.append(f"{gid}:{result}")
         return sent
 
-    async def contact_group(self, gid: str, approach: str) -> str:
+    async def contact_group(self, gid: str, approach: str, *, step: str = "outreach1") -> str:
         spec = self.mcfg["approaches"][approach]
         ents = [e for e in self.rt.pipeline.list(self.mission_id)
                 if self._group_of(e) == gid and e.state in self.rt.pipeline.spec.initial]
@@ -348,7 +382,7 @@ class MissionRunner:
             from apps.documents import generate
             extra.append(await generate(self.rt, self.mission_id, "statement_of_account", group=gid))
         out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents], purpose=spec["purpose"],
-                             extra_documents=extra)
+                             extra_documents=extra, step=step)
         refs = ",".join(e.external_ref for e in ents)
         self._say(f"{gid} [{approach}] {refs}: " + "; ".join(out.attempts)
                   + (f" -> {sum(t.ok for t in out.transitions)}/{len(ents)} CONTACTED" if out.ok else ""))
@@ -362,11 +396,30 @@ class MissionRunner:
             return "deferred"
         return "sent" if out.ok else "failed"
 
-    async def review(self, prog: Progress) -> TickDecision:
+    FAILURE_EVENTS = ["task.failed", "fallback.exhausted", "mission.group_contacted", "settlement.receipt_task",
+                      "policy.deny", "message.classification_failed"]
+
+    def failures_since_review(self) -> list[dict[str, Any]]:
+        """What went wrong since the agent last reviewed (L3 replan input). Successes are filtered out."""
+        since = int(self.mission.data.get("reviewed_seq", 0))
+        out = []
+        for e in self.rt.events.query(mission_id=self.mission_id, types=self.FAILURE_EVENTS, since_seq=since):
+            p = e.payload
+            if e.type in {"mission.group_contacted", "settlement.receipt_task"} and p.get("ok", True):
+                continue
+            out.append({"type": e.type, "at": e.occurred_at.isoformat(),
+                        **{k: p[k] for k in ("group", "refs", "stage", "error", "attempts", "what", "tool", "reason",
+                                             "rule", "detail") if k in p}})
+        return out[-15:]
+
+    async def review(self, prog: Progress, failures: list[dict[str, Any]] | None = None) -> TickDecision:
         m = self.mission
         recent = m.data.get("actions", [])[-12:]
+        last_seq = self.rt.events.last_seq(mission_id=m.id)
         decision = await self.agent.tick(m.spec, today=self._today(), progress=prog.as_dict(), groups=self.group_rows(),
-                                         levers=self.mcfg["levers"], recent_actions=recent, budget=self.budget)
+                                         levers=self.mcfg["levers"], recent_actions=recent,
+                                         recent_failures=failures or [], budget=self.budget)
+        self.store.update(m.id, data={"reviewed_seq": last_seq})
         self._say(f"review: {decision.assessment}" + (f" | code dropped: {decision.problems}" if decision.problems else ""))
         taken = []
         for action in decision.actions:
@@ -417,6 +470,10 @@ class MissionRunner:
                 out = await self.orch.send_documents(ents, reason="Send the customer a statement of account of all "
                                                                   "their open invoices and ask for a payment date.")
                 results.append(f"{gid}: {'sent' if out.ok else 'failed'}")
+            elif lever == "retry_contact":
+                approach = self.mission.data.get("groups", {}).get(gid, {}).get("suggested_approach") \
+                    or next(iter(self.mcfg["approaches"]))
+                results.append(f"{gid}: {await self.contact_group(gid, approach, step=f'retry:{today}')}")
             elif lever == "re_engage":
                 out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents], step="reengage1",
                                      purpose="The promised payment has not arrived. Politely ask for a new firm date.")

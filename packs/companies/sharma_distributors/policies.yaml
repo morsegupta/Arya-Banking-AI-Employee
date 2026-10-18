@@ -8,7 +8,7 @@ tools:
   apps:
     bank_portal:                     # read-only by construction; anything not listed is refused
       allow: [bank_portal.open, bank_portal.snapshot, bank_portal.click, bank_portal.fill, bank_portal.select,
-              bank_portal.download, bank_portal.screenshot]
+              bank_portal.download, bank_portal.read_table, bank_portal.screenshot]
     erp_web:                         # writes only in a task granted the exact receipt (matcher-approved)
       writes_need_scope: true
 

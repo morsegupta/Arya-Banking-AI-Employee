@@ -60,6 +60,8 @@ Return:
 TICK = """TASK: review progress and choose next actions.
 PROGRESS has the verified value (the only value that counts), what is open per state, and a
 code-computed forecast. GROUPS lists each group's entity states and recent activity.
+RECENT_FAILURES lists what went wrong since the last review (failed tasks, unreachable systems,
+undelivered messages, refused actions): adapt the plan around them, or escalate what you cannot fix.
 Return:
 - assessment: 2-3 sentences: where we stand vs the target and deadline, and why
 - actions: list of {lever: one of LEVERS, groups: [group ids], rationale}. Choose only actions that
@@ -238,11 +240,12 @@ class MissionAgent:
 
     async def tick(self, spec: MissionSpec, *, today: date, progress: dict[str, Any], groups: list[dict[str, Any]],
                    levers: dict[str, dict[str, Any]], recent_actions: list[dict[str, Any]] | None = None,
+                   recent_failures: list[dict[str, Any]] | None = None,
                    budget: Budget | None = None) -> TickDecision:
         payload = {"SPEC": spec.model_dump(mode="json"), "TODAY": f"{today.isoformat()} ({today:%A})",
                    "PROGRESS": progress, "GROUPS": groups,
                    "LEVERS": {k: v.get("description", "") for k, v in levers.items()},
-                   "RECENT_ACTIONS": recent_actions or []}
+                   "RECENT_ACTIONS": recent_actions or [], "RECENT_FAILURES": recent_failures or []}
         p = await self.llm.structured("mission", self._messages(TICK, payload), TickProposal,
                                       budget=budget, tag="mission:tick")
         return self.check_tick(p, groups=groups, levers=levers)

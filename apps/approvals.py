@@ -7,6 +7,8 @@
     concession           approve / reject -> the customer gets the answer (wording allowed by the decision)
     payment_plan         approve -> the customer is offered the plan      reject -> nothing is sent
     mission_plan         approve -> mission ACTIVE                        reject -> replan with the reason
+    budget               approve -> resume with double the token budget   reject -> stays paused
+    failure              (information for a human; nothing automatic)
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ async def decide(rt: Runtime, approval_id: str, *, approve: bool, by: str, note:
         return log
     action = a.payload.get("action")
     handler = {"review_quarantine": _review, "concession": _concession, "payment_plan": _payment_plan,
-               "mission_plan": _mission_plan}.get(action)
+               "mission_plan": _mission_plan, "budget": _budget}.get(action)
     if handler:
         log += await handler(rt, a, approve, by, note)
     return log
@@ -90,4 +92,13 @@ async def _mission_plan(rt: Runtime, a: Approval, approve: bool, by: str, note: 
         runner.approve(by=by)
     else:
         await runner.reject(note or "rejected without a reason")
+    return runner.log
+
+
+async def _budget(rt: Runtime, a: Approval, approve: bool, by: str, note: str) -> list[str]:
+    if not approve:
+        return ["mission stays paused"]
+    from apps.mission import MissionRunner
+    runner = MissionRunner(rt, a.mission_id)
+    runner.resume(by=by, extra_tokens=int(a.payload["max"]))
     return runner.log

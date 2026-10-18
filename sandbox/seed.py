@@ -25,6 +25,7 @@ from sandbox.message_hub import db as hub_db
 
 def reset_state() -> None:
     var = config.var_dir()
+    (var / "chaos.json").unlink(missing_ok=True)
     shutil.rmtree(var / "runtime", ignore_errors=True)
     for suffix in ("", "-wal", "-shm"):
         Path(f"{var / 'sim.db'}{suffix}").unlink(missing_ok=True)

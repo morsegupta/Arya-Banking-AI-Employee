@@ -23,7 +23,7 @@ from pypdf.errors import PdfReadError
 from agents.verifier_agent import FuzzyCriterion, VerifierAgent
 from apps.flows import conversation_facts, outreach, role_cfg, role_prompt
 from apps.runtime import Runtime
-from apps.settlement import Settled, download_statement, lookback, settle
+from apps.settlement import Settled, lookback, settle, statement_records
 from core.injection import redacted
 from core.llm import Budget, LLMError
 from core.models import CriterionResult, Entity, Event, Evidence, VerificationReport
@@ -33,6 +33,7 @@ from tools.base import RunContext
 
 KV_SCHEMA = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 SYSTEM_SENDERS = {"mailer-daemon@hub.example"}
+MAX_MESSAGE_TRIES = 3
 
 
 class Orchestrator:
@@ -115,10 +116,23 @@ class Orchestrator:
                 self._say(f"{channel} inbox unavailable: {res.error}")
                 continue
             for msg in res.output:
+                if msg["from_addr"] not in SYSTEM_SENDERS:
+                    try:
+                        handled.append(await self.handle_message(msg))
+                    except Exception as exc:  # noqa: BLE001 - keep the message; retry it next pass
+                        tries = int(self._kv(f"tries:{msg['id']}", "0")) + 1
+                        self._set_kv(f"tries:{msg['id']}", str(tries))
+                        self._event("message.handling_failed", message_id=msg["id"], error=repr(exc)[:300],
+                                    tries=tries)
+                        if tries < MAX_MESSAGE_TRIES:
+                            self._say(f"message {msg['id']} failed ({exc!r}); will retry next pass")
+                            break           # cursor stays before this message
+                        self._say(f"message {msg['id']} failed {tries} times; handed to a human")
+                        self.escalate_failure(f"message:{msg['id']}", f"Could not process message {msg['id']} "
+                                              f"from {msg['from_addr']}", {"error": repr(exc)[:300]},
+                                              "Read the message and handle it by hand.")
+                # advance only after the message is fully handled: a crash before this re-reads it
                 self._set_kv(f"cursor:{channel}", str(msg["seq"]))
-                if msg["from_addr"] in SYSTEM_SENDERS:
-                    continue
-                handled.append(await self.handle_message(msg))
         return handled
 
     async def handle_message(self, msg: dict) -> dict[str, Any]:
@@ -138,7 +152,7 @@ class Orchestrator:
                          if k in {"customer_name", "balance_paise", "due_date"}}} for e in routed]
         try:
             c = await self.classifier.classify(msg["body"], entities=summaries, today=self.rt.clock.now().date(),
-                                               budget=Budget(20_000))
+                                               budget=self.rt.budget(self.mission_id, 20_000))
         except LLMError as exc:
             self._event("message.classification_failed", routed[0], message_id=msg["id"], error=str(exc)[:300])
             self._say(f"{refs_txt}: could not classify {msg['id']}: {exc}")
@@ -199,6 +213,14 @@ class Orchestrator:
                 self._say(f"{e.external_ref}: {tr.from_state} -> {target} "
                           + ("ok" if tr.ok else f"refused ({tr.reason}: {tr.guard.failures() if tr.guard else ''})"))
         return {"message": msg["id"], "entity": refs_txt, "intent": c.intent, "moves": results}
+
+    def escalate_failure(self, what: str, title: str, detail: dict[str, Any], next_step: str) -> None:
+        """L4: what the ladder could not fix goes to a human, once per thing per day, with a proposed next step."""
+        a = self.rt.approvals.request(
+            key=f"failure:{self.mission_id}:{what}:{self.rt.clock.now().date()}", kind="decision",
+            mission_id=self.mission_id, title=title,
+            payload={"action": "failure", "what": what, "detail": detail, "question": next_step})
+        self._event("handoff.requested", what=what, approval_id=a.id, detail=detail)
 
     # --- trust: injection, fraud, concessions, promise verification ------------------------------
 
@@ -305,7 +327,7 @@ class Orchestrator:
                 evidence=tok.tokenize(msg["body"]),
                 context={"amount": c.amount_minor, "date": c.date.isoformat() if c.date else None}))
         try:
-            report = await self.verifier.verify(entity.id, checks, fuzzy, budget=Budget(10_000))
+            report = await self.verifier.verify(entity.id, checks, fuzzy, budget=self.rt.budget(self.mission_id, 10_000))
         except LLMError as exc:
             report = VerificationReport(subject_id=entity.id, passed=False, confidence=0.0, criteria=[
                 *checks, CriterionResult(criterion="second opinion", passed=False, note=f"verifier unavailable: {exc}")])
@@ -393,14 +415,18 @@ class Orchestrator:
         if not any(self.rt.pipeline.list(self.mission_id, s) for s in open_states):
             return []
         start, end = lookback(self.rt)
-        self._say(f"bank sync: Operator downloading statement {start} .. {end}")
-        path, res = await download_statement(self.rt, self.mission_id, start, end)
+        read = await statement_records(self.rt, self.mission_id, start, end)
         self._set_kv("last_sync", today.isoformat())
         self.sync_requested = False
-        if path is None:
-            self._say(f"bank sync failed: {getattr(res, 'error', res)}")
+        if read.records is None:
+            self._say(f"bank sync FAILED on every route: {read.attempts}")
+            self.escalate_failure("bank_sync", f"Bank statement could not be read on {today}",
+                                  {"attempts": read.attempts},
+                                  "Check the bank portal; payments cannot be reconciled until it works.")
             return []
-        settled = await settle(self.rt, self.mission_id, path)
+        if read.rung != "playbook":
+            self._say(f"bank sync via fallback '{read.rung}' after: {read.attempts}")
+        settled = await settle(self.rt, self.mission_id, read.records, read.source)
         for s in settled:
             tr = s.transition
             self._say(f"{s.entity_ref}: matched {s.match.record_id} ({s.match.kind}, {s.match.matched_amount}) "

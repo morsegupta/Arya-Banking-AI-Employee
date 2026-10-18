@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}New receipt — {{ inv.number }}{% endblock %}
+{% block content %}
+<h1>Receipts › New › {{ inv.number }}</h1>
+<p class="notice">We have refreshed this screen. Fields have moved.</p>
+<p>{{ inv.customer_name }} · Outstanding <strong>{{ inv.balance_paise|inr }}</strong></p>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/invoices/{{ inv.number }}/receipts" aria-label="New receipt">
+  <label for="reference">UTR / Reference no.</label>
+  <input id="reference" name="reference" required>
+  <label for="mode">Mode</label>
+  <select id="mode" name="mode">{% for m in modes %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select>
+  <label for="amount">Received amount</label>
+  <input id="amount" name="amount" inputmode="decimal" required>
+  <label for="receipt_date">Value date</label>
+  <input id="receipt_date" name="receipt_date" type="date" value="{{ today.isoformat() }}" required>
+  <label for="remarks">Narration</label>
+  <input id="remarks" name="remarks">
+  <p><a href="/invoices/{{ inv.number }}">Back</a> <button type="submit">Save receipt</button></p>
+</form>
+{% endblock %}

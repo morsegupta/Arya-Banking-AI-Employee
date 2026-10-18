@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from sandbox.bank_portal import db as bank_db
 from sandbox.bank_portal.db import DB_NAME
+from sandbox import chaos
 from sandbox.common import clock, config, db
 from sandbox.common.money import format_inr, paise_to_str
 from sandbox.common.web import SessionStore, check_password, templates
@@ -129,6 +130,8 @@ def summary(request: Request, user: str = Depends(portal_user)):
 @app.get("/statement", response_class=HTMLResponse)
 def statement(request: Request, from_date: str | None = None, to_date: str | None = None, page: int = 1,
               user: str = Depends(portal_user)):
+    if chaos.take_transient("bank.transient_errors"):
+        raise HTTPException(503, "Service temporarily unavailable. Please try again.")
     start, end = parse_range(from_date, to_date)
     rows = statement_rows(start, end)
     pages = max(1, -(-len(rows) // PAGE_SIZE))
@@ -144,6 +147,10 @@ def statement(request: Request, from_date: str | None = None, to_date: str | Non
 @app.get("/statement/download")
 def download(format: str = "csv", from_date: str | None = None, to_date: str | None = None,
              user: str = Depends(portal_user)):
+    if chaos.take_transient("bank.transient_errors"):
+        raise HTTPException(503, "Service temporarily unavailable. Please try again.")
+    if format == "csv" and chaos.get("bank.csv_download") == "error":
+        raise HTTPException(503, "Statement download is temporarily unavailable.")
     start, end = parse_range(from_date, to_date)
     rows = statement_rows(start, end)
     stem = f"statement_{start.isoformat()}_{end.isoformat()}"

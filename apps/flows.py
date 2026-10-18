@@ -71,7 +71,7 @@ async def run_task(rt: Runtime, mission_id: str, task_type: str, goal: str | Non
                 success_criteria=success_criteria or [], apps=spec["apps"], max_actions=spec.get("max_actions", 15),
                 write_scope=write_scope or {})
     try:
-        return await make_operator(rt).run(task, context=context)
+        return await make_operator(rt).run(task, context=context, budget=rt.budget(mission_id, 80_000))
     finally:
         await rt.sessions.end_task(task.id)
 
@@ -168,7 +168,7 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
     entities = [item.entity for item in loaded]
     key = loaded[0].entity.id if len(loaded) == 1 else group_key(entities)
     attempts: list[str] = []
-    budget = Budget(40_000)
+    budget = rt.budget(mission_id, 40_000)
     avoid: list[str] = []
     for channel in channels or cfg["channel_order"]:
         to = contact.get(channel)
@@ -208,8 +208,8 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
                 return OutreachOutcome(False, channel, None, None, attempts, held=policy["approval_id"])
             if policy and policy["policy_action"] == "defer":
                 return OutreachOutcome(False, channel, None, None, attempts, deferred_until=policy["retry_at"])
-            if res.error_kind == "permanent":
-                continue                     # L2 fallback: next channel
+            if res.error_kind in {"permanent", "transient"}:
+                continue                     # L2 fallback: bounced, or still failing after L0 retries -> next channel
             break
         attempts.append(f"{channel}: delivered {res.output['id']}")
         sent = {"channel": channel, "message_id": res.output["id"], "thread_id": res.output["thread_id"]}

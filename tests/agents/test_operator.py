@@ -58,8 +58,11 @@ def test_out_of_scope_tool_is_denied_to_the_model(make_runtime):
     assert "outside this task's scope" in tool_msg
 
 
-def test_untrusted_output_is_wrapped_and_old_results_elided(make_runtime):
-    calls = [call("files__read_text", {"path": "policies/credit_policy.md"}, f"r{i}") for i in range(4)]
+def test_untrusted_output_is_wrapped_and_old_results_elided(make_runtime, sandbox_var):
+    for i in range(1, 4):
+        (sandbox_var / "drive" / "policies" / f"note{i}.md").write_text(f"note {i}")
+    paths = ["policies/credit_policy.md", "policies/note1.md", "policies/note2.md", "policies/note3.md"]
+    calls = [call("files__read_text", {"path": p}, f"r{i}") for i, p in enumerate(paths)]
     llm = ScriptedLLM([tools(c) for c in calls] +
                       [tools(call("finish_task", {"summary": "read", "result_call_ids": ["r0"]}))])
     out = run(make_runtime(llm), task(apps=["files"]))
@@ -83,6 +86,16 @@ def test_budget_stops_the_loop(make_runtime):
 
 
 def test_max_actions(make_runtime):
-    c = call("erp__list_customers", {}, "c1")
-    out = run(make_runtime(ScriptedLLM([tools(c)] * 3)), task(max_actions=3))
+    steps = [call("erp__list_customers", {}, "c1"), call("erp__get_customer", {"customer_id": "C01"}, "c2"),
+             call("erp__list_customers", {}, "c3")]
+    out = run(make_runtime(ScriptedLLM([tools(c) for c in steps])), task(max_actions=3))
     assert isinstance(out, FailureReport) and out.stage == "max_actions" and len(out.tried) == 3
+
+
+def test_loop_is_detected_warned_then_stopped(make_runtime):
+    c = call("erp__list_customers", {}, "c1")
+    llm = ScriptedLLM([tools(c)] * 3)
+    out = run(make_runtime(llm), task(max_actions=10))
+    assert isinstance(out, FailureReport) and out.stage == "loop" and len(llm.seen) == 3
+    warned = [m for m in llm.seen[2]["messages"] if m["role"] == "tool"][-1]["content"]
+    assert "Do something different" in warned

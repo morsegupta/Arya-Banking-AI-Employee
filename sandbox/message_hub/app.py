@@ -27,6 +27,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+from sandbox import chaos
 from sandbox.common import clock, config, db
 from sandbox.common.web import templates
 from sandbox.message_hub.db import DB_NAME, MAILER_DAEMON, normalise
@@ -189,6 +190,8 @@ def send(body: SendIn, background: BackgroundTasks, who: Caller = Depends(caller
     to_addr = normalise(body.channel, body.to)
     if not who.may_use(from_addr):
         raise HTTPException(403, f"token '{who.label}' may not send from {from_addr}")
+    if body.channel == "email" and who.allowed != "*" and chaos.get("hub.email_outage"):
+        raise HTTPException(503, "email service temporarily unavailable")
 
     with db.session(DB_NAME) as conn:
         if body.idempotency_key:

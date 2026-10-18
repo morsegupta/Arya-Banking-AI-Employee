@@ -18,6 +18,7 @@ from urllib.parse import quote
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
+from sandbox import chaos
 from sandbox.common import clock, config, db
 from sandbox.common.money import rupees_to_paise
 from sandbox.common.web import SessionStore, check_password, templates
@@ -223,7 +224,8 @@ def invoice_pdf_web(number: str, user: str = Depends(web_user)):
 def receipt_form(request: Request, number: str, error: str | None = None, user: str = Depends(web_user)):
     with db.session(DB_NAME) as conn:
         inv = get_invoice(conn, number)
-    return tpl.TemplateResponse(request, "receipt_form.html", {
+    template = "receipt_form_v2.html" if chaos.get("erp.layout") == "v2" else "receipt_form.html"
+    return tpl.TemplateResponse(request, template, {
         "user": user, "inv": inv, "modes": RECEIPT_MODES, "error": error, "today": clock.today()})
 
 

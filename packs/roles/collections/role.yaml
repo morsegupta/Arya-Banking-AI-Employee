@@ -189,7 +189,13 @@ mission:
 
   # What the Mission Agent may ask for on a tick. `states`: the lever applies to groups with an entity
   # in one of these states. The runtime executes levers; some need human approval.
+  max_replans_per_day: 2           # extra reviews triggered by failures (L3), on top of the daily one
+  token_budget: 500000             # whole mission; paused for a human when spent
+
   levers:
+    retry_contact:
+      description: "Contact a customer whose first message failed (all channels), trying again now."
+      states: [OVERDUE]
     follow_up:
       description: "Send a follow-up on the next channel to a customer who has not replied."
       states: [CONTACTED]

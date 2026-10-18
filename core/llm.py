@@ -91,16 +91,49 @@ class LLMResponse:
 
 @dataclass
 class Budget:
-    """Token budget (prompt + completion) for one mission or task."""
+    """Token budget (prompt + completion) for one call site, task or mission.
+
+    A budget may have a parent (e.g. a task inside a mission): charges flow up, and a call is
+    refused when it or any ancestor is spent."""
     max_tokens: int
     used: int = 0
+    parent: "Budget | None" = None
 
     def charge(self, tokens: int) -> None:
         self.used += tokens
+        if self.parent:
+            self.parent.charge(tokens)
 
     def check(self) -> None:
         if self.used >= self.max_tokens:
             raise BudgetExceeded(f"token budget exhausted ({self.used}/{self.max_tokens})")
+        if self.parent:
+            self.parent.check()
+
+
+class PersistentBudget(Budget):
+    """A mission's budget, kept in the database so it survives restarts and spans CLI runs."""
+
+    SCHEMA = "CREATE TABLE IF NOT EXISTS budgets (key TEXT PRIMARY KEY, used INTEGER NOT NULL, max INTEGER NOT NULL);"
+
+    def __init__(self, db, key: str, max_tokens: int):
+        db.ensure_schema(self.SCHEMA)
+        with db.transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO budgets VALUES (?, 0, ?)", (key, max_tokens))  # first use sets the limit
+            row = conn.execute("SELECT used, max FROM budgets WHERE key = ?", (key,)).fetchone()
+        super().__init__(max_tokens=row["max"], used=row["used"])
+        self.db, self.key = db, key
+
+    def charge(self, tokens: int) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE budgets SET used = used + ? WHERE key = ?", (tokens, self.key))
+            row = conn.execute("SELECT used, max FROM budgets WHERE key = ?", (self.key,)).fetchone()
+            self.used, self.max_tokens = row["used"], row["max"]
+
+    def raise_limit(self, extra: int) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE budgets SET max = max + ? WHERE key = ?", (extra, self.key))
+            self.max_tokens = conn.execute("SELECT max FROM budgets WHERE key = ?", (self.key,)).fetchone()["max"]
 
 
 _DURATION = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$")

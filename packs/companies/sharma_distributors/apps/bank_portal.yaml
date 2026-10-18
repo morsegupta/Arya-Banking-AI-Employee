@@ -15,7 +15,19 @@ notes:
   - Statements live under "Account statement"; set From/To dates then "View statement".
   - CSV download link is on the statement page; it covers the selected date range.
   - Sessions expire after about 5 minutes.
+playbooks:                          # scripted, no LLM; tried first (procedural memory)
+  download_statement:
+    - { open: "/statement?from_date={start}&to_date={end}" }
+    - { download: "Download CSV" }
+  read_statement_table:             # last resort when no download works: read the screen, page by page
+    - { open: "/statement?from_date={start}&to_date={end}" }
+    - { read_table: "Transactions", next: "Next page", max_pages: 30 }
 exports:
+  statement_table:                  # the on-screen statement table
+    date:   { columns: ["Date", "Txn Date"], format: ["%Y-%m-%d", "%d/%m/%y", "%d/%m/%Y"] }
+    text:   { columns: ["Narration", "Description"] }
+    ref:    { columns: ["Chq./Ref.No.", "Reference"] }
+    credit: { columns: ["Deposit Amt.", "Credit"] }
   statement_csv:                    # column names seen in this bank's CSV; alternatives cover format changes
     date:   { columns: ["Date", "Txn Date"], format: "%d/%m/%y" }
     text:   { columns: ["Narration", "Description"] }

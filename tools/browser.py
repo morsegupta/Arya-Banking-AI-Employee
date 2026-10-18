@@ -38,6 +38,14 @@ from tools.vault import Vault
 
 NAV_SETTLE_MS = 3000
 
+TABLES_JS = r"""
+() => [...document.querySelectorAll('table')].map(t => ({
+  label: t.getAttribute('aria-label') || t.querySelector('caption')?.innerText.trim() || '',
+  headers: [...t.querySelectorAll('thead th')].map(th => th.innerText.trim()),
+  rows: [...t.querySelectorAll('tbody tr')].map(tr => [...tr.querySelectorAll('td')].map(td => td.innerText.trim()))
+}))
+"""
+
 SNAPSHOT_JS = r"""
 () => {
   document.querySelectorAll('[data-op-ref]').forEach(e => e.removeAttribute('data-op-ref'));
@@ -185,11 +193,13 @@ class BrowserDriver:
         if reason:
             raise ToolDenied(reason)
         try:
-            await self.page.goto(url, wait_until="domcontentloaded")
+            resp = await self.page.goto(url, wait_until="domcontentloaded")
         except PlaywrightTimeout as exc:
             raise TransientToolError(f"timeout loading {url}") from exc
         except PlaywrightError as exc:
             raise TransientToolError(f"could not load {url}: {exc.message.splitlines()[0]}") from exc
+        if resp is not None and (resp.status >= 500 or resp.status == 429):
+            raise TransientToolError(f"{urlparse(url).path} answered HTTP {resp.status}; try again shortly")
 
     async def login(self, app: AppMap) -> None:
         if app.login is None:
@@ -306,6 +316,12 @@ class BrowserDriver:
         except PlaywrightError as exc:
             raise PermanentToolError(f"cannot select {value!r} in {ref}: {exc.message.splitlines()[0]}") from exc
         return await self.observe()
+
+    async def read_tables(self) -> list[dict[str, Any]]:
+        """Every table on the page as {label, headers, rows}: reading what a person would read."""
+        if self.page is None or self.page.url == "about:blank":
+            raise PermanentToolError("no page open; use open first")
+        return await self.page.evaluate(TABLES_JS)
 
     async def download(self, ref: str, dest_dir: Path) -> Evidence:
         info = await self._ensure_ref(ref)
@@ -473,6 +489,17 @@ class DownloadTool(_BrowserTool):
         return ToolResult(ok=True, output={"path": ev.ref, **ev.data}, evidence=[ev])
 
 
+class ReadTableTool(_BrowserTool):
+    action = "read_table"
+    description = "Read the tables on the current page as headers + rows of text (no refs needed)."
+    input_schema = NoArgs
+
+    async def run(self, args: NoArgs, ctx: RunContext) -> ToolResult:
+        driver = await self.sessions.driver(ctx)
+        return ToolResult(ok=True, output={"url": driver.page.url, "tables": await driver.read_tables()},
+                          untrusted=True)
+
+
 class ScreenshotTool(_BrowserTool):
     action = "screenshot"
     description = "Save a full-page screenshot as evidence."
@@ -484,7 +511,7 @@ class ScreenshotTool(_BrowserTool):
         return ToolResult(ok=True, output={"path": ev.ref}, evidence=[ev])
 
 
-BROWSER_TOOLS = (OpenTool, SnapshotTool, ClickTool, FillTool, SelectTool, DownloadTool, ScreenshotTool)
+BROWSER_TOOLS = (OpenTool, SnapshotTool, ClickTool, FillTool, SelectTool, DownloadTool, ReadTableTool, ScreenshotTool)
 
 
 def register_browser_tools(registry: ToolRegistry, sessions: BrowserSessions) -> None:

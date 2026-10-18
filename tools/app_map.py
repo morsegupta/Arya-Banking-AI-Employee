@@ -37,6 +37,8 @@ class AppMap(BaseModel):
     scoped_writes: bool = False
     notes: list[str] = Field(default_factory=list)               # hints for the Operator (playbook seeds)
     exports: dict[str, Any] = Field(default_factory=dict)         # how to read files this app produces
+    # scripted procedures (procedural memory): run without an LLM; the Operator is the fallback
+    playbooks: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
     @property
     def origin(self) -> str:

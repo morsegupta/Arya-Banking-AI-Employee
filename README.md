@@ -9,7 +9,7 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 2 midday complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 2 afternoon complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
 covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
 that commits the company waits in an approvals inbox; text that tries to instruct the AI is
@@ -24,7 +24,37 @@ quarantined before any agent reads it; and models never see account numbers, ema
 | Day 2 morning | Mission Agent (brief → spec → plan → daily review), mission state machine, Prioritizer, Matcher for one-payment-many-invoices and partials, multi-invoice Reply Classifier, Document Generator (statement of account) |
 | Day 2 midday | Verifier Agent + Evidence Collector, Policy Gate + `policies.yaml`, Approval Broker + `approvals` CLI, Injection Guard (Prompt Guard 2 + patterns, quarantine path), PII tokenization, fraud and concession handling |
 
-Next: Day 2 afternoon — reliability (fallbacks, replan, loop detection, budgets, resume after kill, chaos).
+| Day 2 afternoon | Reliability ladder (playbooks → Operator → on-screen table → human), channel fallback on outages, Operator loop detection, persistent mission token budget with pause/resume, replan on failures, resume after kill (inbox, settlement), sandbox chaos switches |
+
+Next: Day 2 evening — workspace UI (Home, invoice board, timeline, approvals inbox, mission chat).
+
+## Reliability (Day 2 afternoon)
+
+| Level | What happens | Where |
+|---|---|---|
+| L0 retry | Timeouts, HTTP 5xx/429 (now also on page loads), provider errors: 3 tries with backoff | [tools/base.py](tools/base.py), [tools/browser.py](tools/browser.py) |
+| L1 local adapt | Session expired → log in again; renamed CSV columns → alternative column names; Operator warned when it repeats itself, stopped on a loop | [agents/operator_agent.py](agents/operator_agent.py) |
+| L2 fallback | Bank statement: **scripted playbook** (no LLM) → **Operator** (LLM adapts to a changed portal) → **read the on-screen table** page by page. Email bounce *or outage* → WhatsApp. The Verifier re-reads the bank the same way, never through the route that settled the money | [apps/settlement.py](apps/settlement.py), [apps/playbooks.py](apps/playbooks.py), [bank_portal.yaml](packs/companies/sharma_distributors/apps/bank_portal.yaml) |
+| L3 replan | Failures since the last review (failed tasks, undelivered contacts, exhausted fallbacks, refusals) trigger an extra Mission Agent review (max 2/day) with `RECENT_FAILURES`; new lever `retry_contact` | [apps/mission.py](apps/mission.py) |
+| L4 escalate | Whatever the ladder cannot fix becomes an approvals-inbox item with what was tried and a proposed next step | orchestrator `escalate_failure` |
+| Budgets | Per-call and per-task budgets roll up into a **mission budget kept in the database** (survives restarts). When spent, the mission pauses and asks a human; approving resumes with double | [core/llm.py](core/llm.py) |
+| Resume after kill | Inbox position advances only after a message is fully handled (a poison message goes to a human after 3 tries). Settlement is write-ahead: a payment seen but not finished (`MATCHED`/`POSTED`) is finished on the next run, reusing an existing receipt | [apps/orchestrator.py](apps/orchestrator.py), [apps/settlement.py](apps/settlement.py) |
+
+Bank sync now costs **no LLM tokens** on a normal day (the playbook); the Operator is only called when the portal changes.
+
+Chaos switches (sandbox only; re-seeding clears them):
+
+```bash
+uv run python -m sandbox.chaos set bank.csv_download=error hub.email_outage=true
+```
+
+```bash
+uv run python -m sandbox.chaos set bank.session_ttl=20 bank.csv_schema=v2 bank.transient_errors=2 erp.layout=v2
+```
+
+```bash
+uv run python -m sandbox.chaos clear
+```
 
 ## Trust layer (Day 2 midday)
 
@@ -252,10 +282,12 @@ uv run python -m apps.cli events [-n 30]                         # event log + h
 uv run python -m apps.cli mission new "<brief>"                  # Mission Agent: spec + scope + plan
 uv run python -m apps.cli mission show|board|plan|approve|tick   # inspect, (re)plan, approve, one tick
 uv run python -m apps.cli mission answer "<text>"                # answer the agent's blocking questions
+uv run python -m apps.cli mission resume [--extra-tokens N]      # resume a paused mission
 uv run python -m apps.cli mission run [--days 5] [--sim-llm]     # tick daily with simulated customers
 uv run python -m apps.cli approvals [list|show|approve|reject]   # the human decisions inbox
 uv run python -m sandbox.customer_sim tick [--llm]               # simulated customers act
 uv run python -m sandbox.customer_sim advance 1d                 # move simulated time
+uv run python -m sandbox.chaos set|show|clear                    # make the sandbox misbehave
 ```
 
 ## Tests
@@ -264,7 +296,7 @@ uv run python -m sandbox.customer_sim advance 1d                 # move simulate
 make test
 ```
 
-260 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+271 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -279,7 +311,11 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 2 afternoon+).** Chaos/recovery scenarios, workspace UI, eval harness, memory.
+- **Not built yet (Day 2 evening+).** Workspace UI and API, eval harness, memory.
+- No vision (computer-use) driver: when the DOM route and the on-screen table both fail, the ladder ends
+  with a human. `erp.layout=v2` is a test for the live Operator (LLM); scripted tests cannot adapt to it.
+- Resume covers the inbox and settlement; an Operator task killed mid-way is simply run again
+  (its tools are idempotent), not continued from its last step.
 - If the injection classifier is unreachable, inbound messages are quarantined (fail closed) and page
   observations fall back to pattern checks only.
 - Attachments that are not text (images, scans) cannot be screened; no agent reads them either.

@@ -14,6 +14,7 @@ Bounded ReAct loop (architecture §6.2):
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -70,6 +71,11 @@ class OperatorConfig:
     keep_full_results: int = 2
     max_nudges: int = 2
     task_token_budget: int = 80_000
+    max_repeats: int = 2              # same call, same result: warn at this count, fail after it
+
+
+def _digest(output: Any) -> str:
+    return hashlib.sha256(json.dumps(output, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def _render_result(call_id: str, result: ToolResult) -> str:
@@ -134,6 +140,7 @@ class OperatorAgent:
         results: dict[str, ToolResult] = {}
         tried: list[str] = []
         nudges = 0
+        seen_calls: dict[str, int] = {}        # loop detection: identical call + identical outcome
         task.status = TaskStatus.EXECUTING
         self._event(task, "task.started", type=task.type, goal=task.goal, apps=task.apps)
 
@@ -212,6 +219,13 @@ class OperatorAgent:
                         continue
                 result = await self.registry.invoke(call.name, args, ctx)
                 results[call.id] = result
+                signature = json.dumps([call.name, args, result.ok, result.error, _digest(result.output)],
+                                       sort_keys=True, default=str)
+                seen_calls[signature] = seen_calls.get(signature, 0) + 1
+                if seen_calls[signature] > self.cfg.max_repeats:
+                    self._event(task, "task.loop_detected", tool=call.name, repeats=seen_calls[signature])
+                    return fail("loop", f"repeated {call.name} with the same arguments and the same result "
+                                        f"{seen_calls[signature]} times", "replan with a different approach")
                 tried.append(f"{call.name}({json.dumps(call.arguments, ensure_ascii=False)[:120]}) -> "
                              f"{'ok' if result.ok else result.error_kind}")
                 self._event(task, "task.step", step=step, tool=call.name, ok=result.ok,
@@ -227,6 +241,9 @@ class OperatorAgent:
                             self.on_flag(task, screening)
                         content = json.dumps({"call_id": call.id, "ok": True, "output": redacted(content, screening),
                                               "quarantined": True})
+                if seen_calls[signature] == self.cfg.max_repeats:
+                    content += ("\nNOTE: you have now made this exact call with this exact result "
+                                f"{self.cfg.max_repeats} times. Do something different, or call fail_task.")
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
             self._compact(messages)
 

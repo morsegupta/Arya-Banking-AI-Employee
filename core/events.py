@@ -100,6 +100,13 @@ class EventStore:
         with self.db.read() as conn:
             return [_row_to_event(r) for r in conn.execute(sql + " ORDER BY seq LIMIT ?", [*args, limit])]
 
+    def last_seq(self, *, mission_id: str | None = None) -> int:
+        sql, args = "SELECT COALESCE(MAX(seq), 0) AS s FROM events", []
+        if mission_id is not None:
+            sql, args = sql + " WHERE mission_id = ?", [mission_id]
+        with self.db.read() as conn:
+            return int(conn.execute(sql, args).fetchone()["s"])
+
     def verify_chain(self) -> tuple[bool, int | None]:
         """Recompute every hash. Returns (ok, first bad seq)."""
         prev = GENESIS

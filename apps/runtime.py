@@ -19,7 +19,7 @@ from core.approvals import Approval, ApprovalBroker
 from core.clock import Clock, FileClock, SystemClock
 from core.events import EventBus, EventStore
 from core.injection import InjectionGuard
-from core.llm import LLMClient
+from core.llm import Budget, LLMClient, PersistentBudget
 from core.pii import Tokenizer
 from core.pipeline import Pipeline, load_pipeline
 from core.policy import PolicyGate
@@ -67,6 +67,18 @@ class Runtime:
     obs_guard: InjectionGuard | None = None      # tool observations (pages, files) on every Operator step
     evidence: EvidenceCollector | None = None
     _closers: list[Any] = field(default_factory=list)
+
+    def mission_budget(self, mission_id: str | None) -> Budget | None:
+        """The mission's token budget, kept in the database (role pack: mission.token_budget)."""
+        if not mission_id:
+            return None
+        limit = (yaml.safe_load((self.role_dir / "role.yaml").read_text()).get("mission", {})
+                 .get("token_budget", 500_000))
+        return PersistentBudget(self.db, f"mission:{mission_id}", limit)
+
+    def budget(self, mission_id: str | None, tokens: int) -> Budget:
+        """A budget for one call site or task, charged to its mission's budget as well."""
+        return Budget(tokens, parent=self.mission_budget(mission_id))
 
     def tokenizer(self) -> Tokenizer:
         """A fresh PII tokenizer (one per prompt/draft) with the company's patterns."""
