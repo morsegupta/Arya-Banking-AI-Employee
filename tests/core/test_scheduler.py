@@ -104,3 +104,22 @@ def test_run_loop_stops(scheduler, clock):
 
     asyncio.run(go())
     assert scheduler.pending() == []
+
+
+def test_a_rearmed_timer_fires_again(runtime_db, events):
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from core.clock import ManualClock
+    from core.events import EventBus
+    from core.scheduler import Scheduler
+
+    clock = ManualClock(datetime(2026, 10, 19, 10, tzinfo=timezone.utc))
+    s = Scheduler(runtime_db, EventBus(events), clock)
+    s.schedule("k", clock.now() + timedelta(hours=1), "timer.x")
+    clock.advance(timedelta(hours=2))
+    assert len(asyncio.run(s.fire_due())) == 1
+    assert not s.schedule("k", clock.now() + timedelta(hours=1), "timer.x")             # fired: left alone
+    assert s.schedule("k", clock.now() + timedelta(hours=1), "timer.x", rearm=True)    # state re-entered
+    clock.advance(timedelta(hours=2))
+    assert len(asyncio.run(s.fire_due())) == 1, "the second firing is a new event, not a duplicate"

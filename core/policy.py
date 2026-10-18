@@ -5,7 +5,7 @@ Order, first match wins:
                   writes on an app that needs a per-task grant when the task has none      -> deny
   2. content      phrases the company never says (threats, ...)                            -> deny
   3. timing       quiet hours, weekdays only                                               -> defer
-  4. volume       at most N contacts per person per window                                 -> defer
+  4. volume       at most N contacts per counterparty (all channels) per window            -> defer
   5. a human already approved this exact call                                              -> allow
   6. quarantine   the entity or task touched content flagged as an injection attempt       -> ask
   7. concessions  phrases that commit the company (discounts, instalments...)              -> ask
@@ -127,13 +127,14 @@ class PolicyGate:
         target_field = getattr(tool, "target_field", None)
         cap = comm.get("max_per_target") if comm else None
         if cap and target_field and args.get(target_field):
-            target = _norm_target(args[target_field])
+            target = self._target_key(args[target_field], ctx)
             recent = self._contacts(target, timedelta(days=cap["days"]))
             if len(recent) >= cap["count"]:
                 retry = min(recent) + timedelta(days=cap["days"])
-                return PolicyDecision("defer", f"{len(recent)} contacts with this person in the last {cap['days']} "
-                                               f"days (max {cap['count']})", "external_comm.max_per_target",
-                                      retry_at=retry)
+                who = "this customer" if getattr(ctx, "counterparty", None) else "this person"
+                return PolicyDecision("defer", f"{len(recent)} contacts with {who} in the last {cap['days']} "
+                                               f"days, any channel (max {cap['count']})",
+                                      "external_comm.max_per_target", retry_at=retry)
 
         # 5. already approved by a human
         key = self.approval_key(tool, args, ctx)
@@ -170,7 +171,8 @@ class PolicyGate:
             entity_id=ctx.entity_id,
             payload={"tool": tool.name, "app": tool.app, "args": args, "reason": reason, "rule": rule,
                      "context": {"mission_id": ctx.mission_id, "task_id": ctx.task_id, "entity_id": ctx.entity_id,
-                                 "idempotency_key": ctx.idempotency_key}})
+                                 "idempotency_key": ctx.idempotency_key,
+                                 "counterparty": getattr(ctx, "counterparty", None)}})
         return PolicyDecision("ask", f"{reason}; waiting for approval {a.id}", rule, approval_id=a.id)
 
     def next_allowed(self, now: datetime, comm: dict[str, Any]) -> datetime | None:
@@ -201,6 +203,13 @@ class PolicyGate:
                 return probe
         return None
 
+    @staticmethod
+    def _target_key(address: Any, ctx: Any) -> str:
+        """Contacts are counted per counterparty when the caller says who it is (all channels together),
+        else per address."""
+        cp = getattr(ctx, "counterparty", None)
+        return f"cp:{cp}" if cp else _norm_target(address)
+
     def _contacts(self, target: str, window: timedelta) -> list[datetime]:
         since = (self.clock.now() - window).isoformat()
         with self.db.read() as conn:
@@ -214,7 +223,7 @@ class PolicyGate:
         target = (args.model_dump() if hasattr(args, "model_dump") else args).get(tool.target_field)
         with self.db.transaction() as conn:
             conn.execute("INSERT INTO policy_contacts (target, at, tool, mission_id, entity_id) VALUES (?,?,?,?,?)",
-                         (_norm_target(target), self.clock.now().isoformat(), tool.name, ctx.mission_id,
+                         (self._target_key(target, ctx), self.clock.now().isoformat(), tool.name, ctx.mission_id,
                           ctx.entity_id))
 
     def contacts_this_window(self, target: str) -> int:

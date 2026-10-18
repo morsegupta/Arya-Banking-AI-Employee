@@ -40,9 +40,10 @@ class Scheduler:
         db.ensure_schema(SCHEMA)
 
     def schedule(self, key: str, due_at: datetime, fire_type: str, *, mission_id: str | None = None,
-                 entity_id: str | None = None, payload: dict[str, Any] | None = None) -> bool:
+                 entity_id: str | None = None, payload: dict[str, Any] | None = None, rearm: bool = False) -> bool:
         """Idempotent by key. Returns True if newly scheduled. A PENDING timer with the same key is
-        moved to the new due time; FIRED/CANCELLED timers are left alone."""
+        moved to the new due time; FIRED/CANCELLED timers are left alone, unless `rearm` (a state was
+        entered again, so its timers start over)."""
         if due_at.tzinfo is None:
             raise ValueError("due_at must be timezone-aware")
         with self.db.transaction() as conn:
@@ -54,6 +55,10 @@ class Scheduler:
                 return True
             if row["status"] == "PENDING":
                 conn.execute("UPDATE timers SET due_at = ? WHERE key = ?", (due_at.isoformat(), key))
+            elif rearm:
+                conn.execute("UPDATE timers SET due_at = ?, status = 'PENDING', payload_json = ? WHERE key = ?",
+                             (due_at.isoformat(), json.dumps(payload or {}, default=str), key))
+                return True
             return False
 
     def cancel(self, key: str) -> bool:
@@ -78,7 +83,7 @@ class Scheduler:
                 event, created = self.bus.store.append_in(conn, Event(
                     type=row["fire_type"], mission_id=row["mission_id"], entity_id=row["entity_id"],
                     payload={**json.loads(row["payload_json"]), "timer_key": row["key"], "due_at": row["due_at"]},
-                    occurred_at=now, key=f"timer:{row['key']}"))
+                    occurred_at=now, key=f"timer:{row['key']}:{row['due_at']}"))   # a re-armed timer fires again
                 conn.execute("UPDATE timers SET status = 'FIRED', fired_event_seq = ? WHERE key = ?",
                              (event.seq, row["key"]))
                 if created:

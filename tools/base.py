@@ -71,6 +71,7 @@ class RunContext:
     allowed_apps: set[str]                      # capability scope of the current task
     entity_id: str | None = None
     idempotency_key: str | None = None          # required for non-idempotent tools: mission:entity:step
+    counterparty: str | None = None             # who is being reached (e.g. a customer id): contact caps count per counterparty
     artifacts_dir: Path = field(default_factory=lambda: Path("var/runtime/artifacts"))
     # writes this task may make on apps with scoped writes: {app: [{"method", "path", "form": {field: value}}]}
     write_scope: dict[str, list[dict[str, Any]]] = field(default_factory=dict)

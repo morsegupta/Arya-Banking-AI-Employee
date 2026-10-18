@@ -245,8 +245,12 @@ The sandbox clock is simulated: days pass in seconds. Every step is an event in 
 - **Look-alike payments don't count.** "SUNRISE TRADING CO" never matches *Sunrise Hardware*.
 - **Untrusted content stays data.** Pages, PDFs and messages are wrapped as `<untrusted_data>`, and
   screened first: text that tries to instruct the AI is quarantined and never shown to an agent.
-- **Policy before every action.** Threats are refused, quiet hours and contact caps defer, concessions
-  wait for a named human, and an approved action runs exactly as approved.
+- **Policy before every action.** Threats are refused; quiet hours and the weekly cap (per customer,
+  all channels together) defer, and a deferred reminder or follow-up is re-scheduled, not dropped;
+  concessions wait for a named human, and an approved action runs exactly as approved.
+- **A repeated step never fakes progress.** If a send was already done and applied, repeating the step
+  sends nothing and moves nothing. A new promise replaces the old date and moves the reminder and the
+  broken-promise check with it.
 - **Models never see account numbers or contact details.** They write placeholders; code fills them in.
 - **A task can only make the change it was created for.** A receipt task can post one receipt: the
   matched invoice, amount and bank reference, enforced on the wire.
@@ -337,7 +341,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-277 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+282 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -364,7 +368,5 @@ No network or API key is needed for the test suite.
   The company's pattern list catches such phrasings; the score is the higher of the two.
 - Attachments that are not text (images, scans) cannot be screened; no agent reads them either.
 - The forecast uses fixed per-state probabilities from the role pack until memory supplies real history.
-- A new promise from a customer who is already `PROMISED` (e.g. a later date after a reminder) is
-  classified and logged but does not yet replace the old promise date (Day 2 afternoon: replan).
 - A customer whose invoices were settled before their batch still takes a slot in that day's capacity.
 - Sandbox only: real bank portals have MFA and device binding; production should use bank APIs.

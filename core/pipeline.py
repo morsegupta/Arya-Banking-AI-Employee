@@ -213,7 +213,7 @@ class Pipeline:
                          "guard": [c.__dict__ for c in guard.clauses]}))
         moved = self.get(entity_id)
         self._disarm_timers(moved, current)
-        self._arm_timers(moved, to_state, merged_facts, now)
+        self._arm_timers(moved, to_state, merged_facts, now, rearm=True)   # entering a state starts its timers over
         return TransitionResult(True, moved, current, to_state, guard)
 
     # --- timers ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ class Pipeline:
             base = base + delta if sign == "+" else base - delta
         return base
 
-    def _arm_timers(self, entity: Entity, state: str, facts: dict, entered: datetime) -> None:
+    def _arm_timers(self, entity: Entity, state: str, facts: dict, entered: datetime, rearm: bool = False) -> None:
         for spec in self.spec.timers:
             if spec.on != state:
                 continue
@@ -249,7 +249,7 @@ class Pipeline:
             if spec.min_lead and due - entered < _duration(spec.min_lead):
                 continue
             self.scheduler.schedule(self._timer_key(entity, spec), due, spec.do, mission_id=entity.mission_id,
-                                    entity_id=entity.id, payload={"state": state})
+                                    entity_id=entity.id, payload={"state": state}, rearm=rearm)
 
     def _disarm_timers(self, entity: Entity, state: str) -> None:
         for spec in self.spec.timers:

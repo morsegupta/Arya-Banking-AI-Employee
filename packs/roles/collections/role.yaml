@@ -45,6 +45,14 @@ pipeline:
       guard: { all: [ "matcher.matched_amount > 0", "matcher.matched_amount < entity.balance - tolerance",
                       "matcher.counterparty_matches == true", "erp.receipt_exists == true", "verifier.pass == true" ] }
 
+    # A new promise replaces the old one (later date after a reminder, different amount): same evidence
+    # bar as the first promise; the reminder and the broken-promise check move to the new date.
+    - from: PROMISED
+      to: PROMISED
+      guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
+                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists",
+                      "verifier.pass == true" ] }
+
     - from: PARTIALLY_PAID
       to: PROMISED
       guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",

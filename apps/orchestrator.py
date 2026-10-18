@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -199,9 +199,16 @@ class Orchestrator:
             if not moves:
                 moves.append(("ACKNOWLEDGED", {}))
             for target, facts in moves:
-                current = self.rt.pipeline.get(e.id).state
-                if target == current or target not in self.rt.pipeline.allowed_targets(current):
-                    continue
+                now_e = self.rt.pipeline.get(e.id)
+                current = now_e.state
+                if target not in self.rt.pipeline.allowed_targets(current):
+                    continue                    # includes "already there" unless the role pack allows a re-entry
+                if target == current:
+                    old = now_e.data.get("facts", {})
+                    if all(old.get(k) == facts.get(k) for k in ("promise_date", "promise_amount")):
+                        continue                # the same promise repeated: nothing changes
+                    facts = {**facts, "previous_promise": {"date": old.get("promise_date"),
+                                                           "amount": old.get("promise_amount")}}
                 tr = self.rt.pipeline.propose(e.id, target, ctx, facts=facts)
                 if tr.ok and c.quote:
                     self.rt.evidence.collect([Evidence(kind="message", ref=msg["id"], summary=c.quote,
@@ -394,6 +401,7 @@ class Orchestrator:
                                  extra_facts={"promised_date": facts.get("promise_date"),
                                               "promise_quote": facts.get("promise_quote")})
             self._say(f"{','.join(refs)}: promise reminder " + ("; ".join(out.attempts)))
+            self._retry_later(event, out)
         elif event.type == "timer.promise_check_due" and entity.state == "PROMISED":
             await self.bank_sync(force=True)
             entity = self.rt.pipeline.get(entity.id)
@@ -403,7 +411,18 @@ class Orchestrator:
                 self._say(f"{entity.external_ref}: promise date passed without money -> BROKEN_PROMISE "
                           f"{'ok' if tr.ok else tr.reason}")
         elif event.type == "timer.followup_due" and entity.state == "CONTACTED":
-            await self.follow_up(entity)
+            self._retry_later(event, await self.follow_up(entity))
+
+    def _retry_later(self, event: Event, out: Any) -> None:
+        """A timer's message held back by policy (quiet hours, weekend, contact cap) is not dropped:
+        the same timer fires again when the Policy Gate says it may run."""
+        if out is None or not getattr(out, "deferred_until", None):
+            return
+        due = datetime.fromisoformat(out.deferred_until)
+        self.rt.scheduler.schedule(f"retry:{event.type}:{event.entity_id}:{due.isoformat()}", due, event.type,
+                                   mission_id=event.mission_id, entity_id=event.entity_id,
+                                   payload={**event.payload, "retry_of": event.id})
+        self._say(f"{event.type.split('.')[-1]} deferred by policy; will try again {due:%a %d %b %H:%M}")
 
     # --- bank sync ---------------------------------------------------------------------------
 

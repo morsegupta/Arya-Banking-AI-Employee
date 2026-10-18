@@ -130,6 +130,7 @@ class OutreachOutcome:
     held: str | None = None              # approval id: a human must approve this exact message first
     deferred_until: str | None = None    # policy: not now (quiet hours, contact cap); try again later
     draft: dict[str, Any] | None = None  # draft_only: the message that would be sent
+    replayed: bool = False               # this exact step had already been sent and applied
 
 
 def group_facts(rt: Runtime, loaded: list[LoadedEntity]) -> dict[str, Any]:
@@ -174,6 +175,8 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
     documents = [d for item in loaded for d in item.documents] + list(extra_documents or [])
     entities = [item.entity for item in loaded]
     key = loaded[0].entity.id if len(loaded) == 1 else group_key(entities)
+    cp_field = role_cfg(rt)["entity_source"].get("counterparty", {}).get("from_fact")
+    counterparty = str(loaded[0].facts.get(cp_field)) if cp_field and loaded[0].facts.get(cp_field) else None
     attempts: list[str] = []
     budget = rt.budget(mission_id, 40_000)
     avoid: list[str] = []
@@ -202,7 +205,7 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
                     "attachments": turn.attachments, "refs": refs})
             ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id,
                              allowed_apps={channel}, idempotency_key=f"{mission_id}:{key}:{step}:{channel}",
-                             artifacts_dir=rt.artifacts_dir)
+                             artifacts_dir=rt.artifacts_dir, counterparty=counterparty)
             args = {"to": turn.to, "body": turn.body, "attachments": turn.attachments}
             if turn.subject:
                 args["subject"] = turn.subject
@@ -228,7 +231,14 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
             if res.error_kind in {"permanent", "transient"}:
                 continue                     # L2 fallback: bounced, or still failing after L0 retries -> next channel
             break
-        attempts.append(f"{channel}: delivered {res.output['id']}" + (" (approved wording)" if approved else ""))
+        if res.replayed and any((rt.pipeline.get(e.id).data.get("last_contact") or {}).get("message_id")
+                                == res.output["id"] for e in entities):
+            # The same step was done before and its outcome already applied: nothing new went out, so
+            # nothing may move (e.g. a second re-engage after another broken promise).
+            attempts.append(f"{channel}: already sent earlier as {res.output['id']}; not sent again")
+            return OutreachOutcome(False, channel, res.output, None, attempts, replayed=True)
+        attempts.append(f"{channel}: delivered {res.output['id']}" + (" (approved wording)" if approved else "")
+                        + (" (recovered after a restart)" if res.replayed else ""))
         sent = {"channel": channel, "message_id": res.output["id"], "thread_id": res.output["thread_id"]}
         transitions = apply_sent(rt, entities, sent, transition_to=transition_to, step=step)
         return OutreachOutcome(True, channel, res.output, transitions[0] if transitions else None, attempts,
