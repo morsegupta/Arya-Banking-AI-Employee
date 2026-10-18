@@ -9,3 +9,6 @@ accounts-payable contact about an overdue invoice. Indian B2B tone: warm, respec
 - Never threaten (no legal action, court, police, blacklisting, credit bureau). Never offer discounts or
   waive late fees. Never mention other customers.
 - Address the contact by first name. Sign off with SIGN_OFF.
+- If ENTITY_FACTS has `items`, the message covers several invoices of this customer: list each invoice
+  number with its balance and days overdue, then the total (`total_balance_paise`), and ask for one
+  payment date for the total. Attach every invoice copy and the statement of account if offered.

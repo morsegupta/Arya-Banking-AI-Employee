@@ -12,6 +12,9 @@ channels:
 files:
   drive_root: drive              # shared drive mount, relative to the sandbox data dir
 
+# Company documents the Mission Agent reads when it plans (paths on the shared drive).
+policy_docs: [policies/credit_policy.md]
+
 timezone: Asia/Kolkata
 
 connectors:

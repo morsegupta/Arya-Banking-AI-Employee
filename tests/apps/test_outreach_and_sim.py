@@ -80,7 +80,7 @@ def test_outreach_is_idempotent(make_runtime, asgi):
     rt2 = make_runtime(llm)
     second = run_flow(rt2, outreach(rt2, "m1", "INV-2291"))
     assert len(hub_messages(asgi, "ritu.malhotra@globex-retail.example")) == 1
-    assert not second.transition.ok          # already CONTACTED: no OVERDUE->CONTACTED again
+    assert second.transition is None         # already CONTACTED: no OVERDUE->CONTACTED again
 
 
 # --- simulator ------------------------------------------------------------------------------

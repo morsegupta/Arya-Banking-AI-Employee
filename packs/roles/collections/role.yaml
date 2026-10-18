@@ -111,6 +111,7 @@ outreach:
 prompts:
   operator: prompts/operator.md
   conversation: prompts/conversation.md
+  mission: prompts/mission.md
 
 # Reply Classifier slot: the intents this role recognises in counterparty messages.
 reply_classifier:
@@ -130,4 +131,111 @@ reply_classifier:
 reconciliation:
   states: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
   counterparty_field: customer_name
+  order_field: due_date           # allocation order when one payment covers several invoices
   lookback_days: 21
+
+# --- Mission level (Day 2) -------------------------------------------------------------------------
+
+mission:
+  # Which entities a brief can select. The Mission Agent sets `params`; code applies `fixed` and
+  # `exclude` on top, so a brief can never pull in something policy forbids.
+  selection:
+    list_tool: erp.list_invoices
+    list_key: invoices
+    fixed: { status: "OPEN,PARTIALLY_PAID" }
+    params:
+      min_days_overdue: { type: integer, description: "Only invoices at least this many days past their due date" }
+      max_days_overdue: { type: integer, description: "Only invoices at most this many days past their due date" }
+      customer_id: { type: string, description: "Only this customer (ERP customer id, e.g. C02)" }
+    group_tool: erp.list_customers   # the counterparties; one contact covers all of a customer's invoices
+    group_key: customer_id
+    exclude:
+      - { when: "group.legal_hold == true", reason: "customer on legal hold: only the legal team may contact them" }
+      - { when: "group.payment_plan == true", reason: "customer is on an agreed payment plan" }
+      - { when: "item.status == 'DISPUTED'", reason: "invoice is under dispute" }
+      - { when: "item.days_overdue <= 0", reason: "invoice is not yet due" }
+
+  success_criteria:
+    - "Only money matched in the bank, posted as an ERP receipt and verified counts towards the target"
+
+  capacity_per_day: 6              # customers contacted for the first time per day
+  minor_units: 100                 # targets in briefs are rupees
+
+  # Probability that value in each state turns into verified money by a week-long deadline (forecast
+  # prior; memory will replace it with this company's own history).
+  forecast_weights: { OVERDUE: 0.35, CONTACTED: 0.45, ACKNOWLEDGED: 0.5, PROMISED: 0.8, PARTIALLY_PAID: 0.6,
+                      BROKEN_PROMISE: 0.25, NO_RESPONSE: 0.1, DISPUTED: 0.0, ESCALATED: 0.1 }
+
+  approaches:
+    soft_reminder:
+      description: "Friendly reminder with the invoice copies. For a single, not very old invoice."
+      purpose: "Friendly reminder for the overdue invoice(s) listed: ask the customer for a payment date."
+      documents: [entity]
+    firm_with_statement:
+      description: "Firm, polite reminder with a statement of account attached. For several overdue invoices or very old balances."
+      purpose: >-
+        Firm but polite reminder: the invoice(s) listed are well past due. A statement of account is
+        attached. Ask the customer to confirm a payment date for the full balance.
+      documents: [entity, statement_of_account]
+
+  # What the Mission Agent may ask for on a tick. `states`: the lever applies to groups with an entity
+  # in one of these states. The runtime executes levers; some need human approval.
+  levers:
+    follow_up:
+      description: "Send a follow-up on the next channel to a customer who has not replied."
+      states: [CONTACTED]
+    send_statement:
+      description: "Send the customer a statement of account of all their open invoices."
+      states: [CONTACTED, ACKNOWLEDGED, BROKEN_PROMISE]
+    re_engage:
+      description: "Contact a customer again after a broken promise (once)."
+      states: [BROKEN_PROMISE]
+    escalate:
+      description: "Hand the customer to a human (account manager) with the evidence so far."
+      states: [ACKNOWLEDGED, DISPUTED, NO_RESPONSE, BROKEN_PROMISE]
+    propose_payment_plan:
+      description: "Ask the finance manager to approve offering an instalment plan to this customer."
+      states: [ACKNOWLEDGED, BROKEN_PROMISE, NO_RESPONSE]
+      needs_approval: true
+    check_bank:
+      description: "Download a fresh bank statement now and reconcile."
+      needs_groups: false
+
+prioritizer:
+  fields: { ref: number, group: customer_id, group_name: customer_name, value: balance_paise, age: days_overdue }
+  weights: { value: 0.5, age: 0.3, risk: 0.2 }
+  risk_signals: { multi: 0.4, contested_before: 0.4, old: 0.2 }
+  contested_statuses: [DISPUTED]   # a customer with such invoices has contested before
+  old_after_days: 75
+  approach_rules:
+    - { when: "group.multi == true", approach: firm_with_statement }
+    - { when: "group.max_age >= 75", approach: firm_with_statement }
+  default_approach: soft_reminder
+
+documents:
+  statement_of_account:
+    title: "STATEMENT OF ACCOUNT"
+    folder: statements             # on the shared drive
+    filename: "SOA-{group}-{date}.pdf"
+    list_tool: erp.list_invoices
+    list_args: { customer_id: "{group}", status: "OPEN,PARTIALLY_PAID" }
+    list_key: invoices
+    group_name_field: customer_name
+    issuer: ["{company_name}", "Accounts Receivable · {ar_email} · {ar_whatsapp}"]
+    fields:
+      - ["Customer", "{group_name} ({group})"]
+      - ["Statement date", "{date}"]
+    columns:
+      - { key: number, label: "Invoice", width: 28 }
+      - { key: issue_date, label: "Invoice date", width: 28 }
+      - { key: due_date, label: "Due date", width: 28 }
+      - { key: days_overdue, label: "Days overdue", width: 26, align: R }
+      - { key: total_paise, label: "Amount", width: 38, align: R }
+      - { key: balance_paise, label: "Balance due", width: 40, align: R }
+    money: [total_paise, balance_paise]
+    totals:
+      - ["Total balance due", "balance_paise"]
+    notes:
+      - "Please pay to {bank_account_name}, {bank_name}, A/c {bank_account_number}, IFSC {bank_ifsc}."
+      - "Quote the invoice numbers in the payment remarks and send the UTR to {ar_email}."
+      - "Our bank details never change by email or message."

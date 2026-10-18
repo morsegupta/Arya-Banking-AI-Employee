@@ -1,8 +1,10 @@
 """Orchestrator for one mission: turns events into agent work and guarded transitions.
 
 Wakes on:
-- new inbound messages  -> Reply Classifier -> propose ACKNOWLEDGED / PROMISED / DISPUTED
-- timers (scheduler)    -> promise reminder, promise check (-> BROKEN_PROMISE if no money)
+- new inbound messages  -> Reply Classifier -> propose ACKNOWLEDGED / PROMISED / DISPUTED, send
+                           requested documents; one message may cover several entities of one
+                           counterparty (a promised total is allocated oldest first)
+- timers (scheduler)    -> follow-up, promise reminder, promise check (-> BROKEN_PROMISE if no money)
 - the daily bank sync   -> Operator downloads the statement -> settle (match, receipt, verify, PAID)
 
 Agents propose; the pipeline's guards decide. Every step leaves events.
@@ -17,6 +19,7 @@ from apps.runtime import Runtime
 from apps.settlement import Settled, download_statement, lookback, settle
 from core.llm import Budget, LLMError
 from core.models import Entity, Event
+from subagents.matcher import allocate
 from subagents.reply_classifier import ReplyClassifier
 from tools.base import RunContext
 
@@ -65,15 +68,31 @@ class Orchestrator:
 
     # --- inbox ------------------------------------------------------------------------------
 
-    def _route(self, msg: dict) -> Entity | None:
+    def _thread(self, e: Entity) -> str | None:
+        return (e.data.get("facts", {}).get("last_outreach") or e.data.get("last_contact") or {}).get("thread_id")
+
+    def _route(self, msg: dict) -> list[Entity]:
+        """Which entities a message is about: its thread first, then references in its text, then
+        the sender's open entities. Several entities when one conversation covers a counterparty's items."""
         entities = self.rt.pipeline.list(self.mission_id)
-        for e in entities:
-            last = e.data.get("facts", {}).get("last_outreach", {})
-            if last.get("thread_id") and last["thread_id"] == msg["thread_id"]:
-                return e
+        terminal = set(self.rt.pipeline.spec.terminal)
+        by_thread = [e for e in entities if msg.get("thread_id") and self._thread(e) == msg["thread_id"]]
+        if by_thread:
+            return by_thread
         text = f"{msg.get('subject') or ''} {msg['body']}"
         hits = [e for e in entities if e.external_ref in text]
-        return hits[0] if len(hits) == 1 else None
+        if hits:
+            return hits
+        sender = (msg.get("from_addr") or "").lower()
+        return [e for e in entities if e.state not in terminal and sender
+                and sender in {str(v).lower() for v in e.data.get("contact", {}).values() if v}]
+
+    def _order_field(self) -> str:
+        return role_cfg(self.rt)["reconciliation"].get("order_field", "")
+
+    def _oldest_first(self, entities: list[Entity]) -> list[Entity]:
+        f = self._order_field()
+        return sorted(entities, key=lambda e: (str(e.data.get("record", {}).get(f) or "9999"), e.external_ref))
 
     async def process_inbox(self) -> list[dict[str, Any]]:
         handled = []
@@ -93,47 +112,103 @@ class Orchestrator:
         return handled
 
     async def handle_message(self, msg: dict) -> dict[str, Any]:
-        entity = self._route(msg)
-        if entity is None:
+        routed = self._route(msg)
+        if not routed:
             self._event("message.unrouted", message_id=msg["id"], sender=msg["from_addr"])
             self._say(f"message {msg['id']} from {msg['from_addr']} not linked to an entity (needs a human)")
             return {"message": msg["id"], "entity": None}
-        loaded_facts = {k: v for k, v in conversation_facts(self.rt, _Loaded(entity)).items()
-                        if k in {"number", "customer_name", "balance_paise", "due_date"}}
+        summaries = [{"ref": e.external_ref,
+                      **{k: v for k, v in conversation_facts(self.rt, _Loaded(e)).items()
+                         if k in {"customer_name", "balance_paise", "due_date"}}} for e in routed]
+        refs_txt = ",".join(e.external_ref for e in routed)
         try:
-            c = await self.classifier.classify(msg["body"], entity_ref=entity.external_ref,
-                                               entity_summary=loaded_facts, today=self.rt.clock.now().date(),
+            c = await self.classifier.classify(msg["body"], entities=summaries, today=self.rt.clock.now().date(),
                                                budget=Budget(20_000))
         except LLMError as exc:
-            self._event("message.classification_failed", entity, message_id=msg["id"], error=str(exc)[:300])
-            self._say(f"{entity.external_ref}: could not classify {msg['id']}: {exc}")
-            return {"message": msg["id"], "entity": entity.external_ref, "error": str(exc)}
-        self._event("message.classified", entity, message_id=msg["id"], intent=c.intent, confidence=c.confidence,
-                    quote=c.quote, amount=c.amount_minor, date=c.date.isoformat() if c.date else None,
-                    problems=c.problems)
-        self._say(f"{entity.external_ref}: reply classified {c.intent} ({c.confidence:.2f})"
+            self._event("message.classification_failed", routed[0], message_id=msg["id"], error=str(exc)[:300])
+            self._say(f"{refs_txt}: could not classify {msg['id']}: {exc}")
+            return {"message": msg["id"], "entity": refs_txt, "error": str(exc)}
+        targets = self._oldest_first([e for e in routed if e.external_ref in c.entity_refs])
+        for e in targets or routed[:1]:
+            self._event("message.classified", e, message_id=msg["id"], intent=c.intent, confidence=c.confidence,
+                        quote=c.quote, amount=c.amount_minor, date=c.date.isoformat() if c.date else None,
+                        refs=c.entity_refs, problems=c.problems)
+        self._say(f"{refs_txt}: reply classified {c.intent} ({c.confidence:.2f})"
                   + (f", amount {c.amount_minor}, date {c.date}" if c.intent == "promise_to_pay" else "")
+                  + (f", about {c.entity_refs}" if len(routed) > 1 else "")
                   + (f" — problems: {c.problems}" if c.problems else ""))
         ctx = {**c.guard_context(), "message": {"id": msg["id"]}}
-        moves = []
-        if c.intent == "promise_to_pay":
-            moves.append(("PROMISED", c.facts()))
-        if c.intent == "dispute":
-            moves += [("ACKNOWLEDGED", {}), ("DISPUTED", {"dispute_quote": c.quote})]
         if c.intent == "paid_claim":
             self.sync_requested = True      # a claim triggers a bank check; it never moves the entity itself
-        if not moves:
-            moves.append(("ACKNOWLEDGED", {}))
+        if c.intent == "doc_request" and targets:
+            await self.send_documents(targets, msg)
+
+        shares: list[int | None] = [None] * len(targets)
+        if c.intent == "promise_to_pay" and c.amount_minor:
+            tol = self.rt.pipeline.spec.constants.get("tolerance", 0)
+            shares = allocate(c.amount_minor, [int(e.data.get("balance", e.value)) for e in targets], tol)
         results = []
-        for target, facts in moves:
-            current = self.rt.pipeline.get(entity.id).state
-            if target == current or target not in self.rt.pipeline.allowed_targets(current):
-                continue
-            tr = self.rt.pipeline.propose(entity.id, target, ctx, facts=facts)
-            results.append(f"{tr.from_state}->{tr.to_state}:{'ok' if tr.ok else 'refused'}")
-            self._say(f"{entity.external_ref}: {tr.from_state} -> {target} "
-                      + ("ok" if tr.ok else f"refused ({tr.reason}: {tr.guard.failures() if tr.guard else ''})"))
-        return {"message": msg["id"], "entity": entity.external_ref, "intent": c.intent, "moves": results}
+        for e, share in zip(targets, shares):
+            moves: list[tuple[str, dict]] = []
+            if c.intent == "promise_to_pay" and share != 0:
+                facts = c.facts()
+                if share is not None:
+                    facts["promise_amount"] = share
+                if len(targets) > 1:
+                    facts["promise_group"] = [t.external_ref for t in targets]
+                    facts["promise_total"] = c.amount_minor
+                moves.append(("PROMISED", facts))
+            if c.intent == "dispute":
+                moves += [("ACKNOWLEDGED", {}), ("DISPUTED", {"dispute_quote": c.quote})]
+            if not moves:
+                moves.append(("ACKNOWLEDGED", {}))
+            for target, facts in moves:
+                current = self.rt.pipeline.get(e.id).state
+                if target == current or target not in self.rt.pipeline.allowed_targets(current):
+                    continue
+                tr = self.rt.pipeline.propose(e.id, target, ctx, facts=facts)
+                results.append(f"{e.external_ref}:{tr.from_state}->{tr.to_state}:{'ok' if tr.ok else 'refused'}")
+                self._say(f"{e.external_ref}: {tr.from_state} -> {target} "
+                          + ("ok" if tr.ok else f"refused ({tr.reason}: {tr.guard.failures() if tr.guard else ''})"))
+        return {"message": msg["id"], "entity": refs_txt, "intent": c.intent, "moves": results}
+
+    # --- actions on a counterparty's group of entities -------------------------------------------
+
+    def group_of(self, entity: Entity, states: set[str] | None = None) -> list[Entity]:
+        """Entities in the same conversation as `entity` (same thread), optionally only in `states`."""
+        thread = self._thread(entity)
+        members = [e for e in self.rt.pipeline.list(self.mission_id)
+                   if (thread and self._thread(e) == thread) or e.id == entity.id]
+        return self._oldest_first([e for e in members if states is None or e.state in states])
+
+    async def send_documents(self, entities: list[Entity], msg: dict | None = None, *,
+                             reason: str = "Reply to the customer's request: send the documents attached.") -> Any:
+        from apps.documents import generate
+        group_field = role_cfg(self.rt)["mission"]["selection"]["group_key"]
+        group = entities[0].data.get("record", {}).get(group_field)
+        statement = await generate(self.rt, self.mission_id, "statement_of_account", group=group) if group else None
+        channel = msg["channel"] if msg else None
+        out = await outreach(self.rt, self.mission_id, [e.external_ref for e in entities],
+                             step=f"docs:{msg['id'] if msg else self.rt.clock.now().date().isoformat()}",
+                             purpose=reason, transition_to=None, extra_documents=[statement] if statement else [],
+                             channels=[channel] if channel else None)
+        self._say(f"{','.join(e.external_ref for e in entities)}: documents sent ({'; '.join(out.attempts)})")
+        return out
+
+    async def follow_up(self, entity: Entity, *, step: str = "followup1") -> Any:
+        """One follow-up for the entity's conversation, on the next channel after the one last used."""
+        group = self.group_of(entity, {"CONTACTED"})
+        if not group or any(e.data.get("last_contact", {}).get("step") == step for e in group):
+            return None
+        order = role_cfg(self.rt)["outreach"]["channel_order"]
+        last = (group[0].data.get("last_contact") or {}).get("channel")
+        channels = order[order.index(last) + 1:] + order[:order.index(last) + 1] if last in order else order
+        out = await outreach(self.rt, self.mission_id, [e.external_ref for e in group], step=step,
+                             transition_to=None, channels=channels,
+                             purpose="Follow-up: we have not heard back about the invoice(s) listed. Politely ask "
+                                     "for a payment date.")
+        self._say(f"{','.join(e.external_ref for e in group)}: follow-up " + "; ".join(out.attempts))
+        return out
 
     # --- timers -------------------------------------------------------------------------------
 
@@ -143,12 +218,18 @@ class Orchestrator:
         entity = self.rt.pipeline.get(event.entity_id)
         if event.type == "timer.promise_reminder_due" and entity.state == "PROMISED":
             facts = entity.data.get("facts", {})
-            out = await outreach(self.rt, self.mission_id, entity.external_ref, step="promise_reminder",
+            refs = facts.get("promise_group") or [entity.external_ref]
+            group = [e for e in self.rt.pipeline.list(self.mission_id)
+                     if e.external_ref in refs and e.state == "PROMISED"]
+            step = f"promise_reminder:{facts.get('promise_date')}"
+            if any(e.data.get("last_contact", {}).get("step") == step for e in group):
+                return                      # one reminder per promise, even when it covers several entities
+            out = await outreach(self.rt, self.mission_id, [e.external_ref for e in group], step=step,
                                  transition_to=None,
                                  purpose="Polite reminder, one day before the date the customer committed to.",
                                  extra_facts={"promised_date": facts.get("promise_date"),
                                               "promise_quote": facts.get("promise_quote")})
-            self._say(f"{entity.external_ref}: promise reminder " + ("; ".join(out.attempts)))
+            self._say(f"{','.join(refs)}: promise reminder " + ("; ".join(out.attempts)))
         elif event.type == "timer.promise_check_due" and entity.state == "PROMISED":
             await self.bank_sync(force=True)
             entity = self.rt.pipeline.get(entity.id)
@@ -158,7 +239,7 @@ class Orchestrator:
                 self._say(f"{entity.external_ref}: promise date passed without money -> BROKEN_PROMISE "
                           f"{'ok' if tr.ok else tr.reason}")
         elif event.type == "timer.followup_due" and entity.state == "CONTACTED":
-            self._say(f"{entity.external_ref}: follow-up due (cadence handling arrives with the Mission Agent)")
+            await self.follow_up(entity)
 
     # --- bank sync ---------------------------------------------------------------------------
 

@@ -9,8 +9,9 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 1 complete.** One invoice goes `OVERDUE → CONTACTED → PROMISED → PAID` end to end from the CLI,
-verified live on Groq models and covered by an automated end-to-end test.
+**Day 2 morning complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
+a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
+covering all their overdue invoices). Day 1's single-invoice flow still runs end to end.
 
 | Block | Delivered |
 |---|---|
@@ -18,8 +19,49 @@ verified live on Groq models and covered by an automated end-to-end test.
 | Day 1 midday | Runtime foundations: event store, scheduler, tool registry, browser driver, channel and file tools |
 | Day 1 afternoon | LLM client, pipeline + guards, Operator and Conversation agents, customer simulator + payment engine |
 | Day 1 evening | Reply Classifier, Matcher, settlement (receipt + Verifier), orchestrator, end-to-end demo |
+| Day 2 morning | Mission Agent (brief → spec → plan → daily review), mission state machine, Prioritizer, Matcher for one-payment-many-invoices and partials, multi-invoice Reply Classifier, Document Generator (statement of account) |
 
-Next: Day 2 — Mission Agent (brief → plan → batches), Policy Gate, approvals, injection guard, workspace UI.
+Next: Day 2 midday — Verifier agent, Policy Gate, Approval Broker, injection guard.
+
+## Run a mission from a brief
+
+```bash
+uv run python -m apps.cli mission new "Collect the 45+ day overdue invoices — target ₹12L by Friday."
+```
+
+Arya reads the brief and the credit policy, picks the invoices, ranks customers and proposes a plan:
+
+```
+  scope: 15 entities in 12 groups, value 162100000; excluded 2: INV-2248 (customer on legal hold ...),
+         INV-2259 (customer is on an agreed payment plan)
+  target: ₹12,00,000.00   deadline: Fri 23 Oct 2026 18:00
+  day 0: Day0 Firm Batch [firm_with_statement] C02 Initech Supplies LLP (3), C08 Lotus Foods (2), ...
+  day 1: Day1 Soft Batch [soft_reminder] C12 Nilgiri Wholesale (1), C05 Sunrise Hardware (1), ...
+```
+
+Nothing is sent until a human approves. Then tick once per (simulated) day:
+
+```bash
+uv run python -m apps.cli mission approve
+```
+
+```bash
+uv run python -m apps.cli mission run --days 5
+```
+
+`mission board` shows verified vs target and every customer's invoices by stage.
+
+What is decided by the model and what by code:
+
+| Step | Model proposes | Code checks / decides |
+|---|---|---|
+| Understand | objective, scope, target as written, deadline, selection parameters | target parsed from the brief's own text; deadline not in the past; only declared selection parameters |
+| Select | — | policy exclusions (legal hold, payment plan, disputed, not due) applied on top, always |
+| Rank | — | Prioritizer: value × age × risk per customer; approach rules from the role pack |
+| Plan | batches, approach, order, rationale | known customers only, each once, ≤ capacity per day, anything forgotten appended |
+| Approve | — | human only (`AWAITING_PLAN_APPROVAL → ACTIVE`) |
+| Daily review | assessment + levers (follow-up, statement, escalate, payment plan…) | only role-pack levers, only for customers in the states a lever applies to; payment plans → approval request |
+| Complete | — | only when **verified** money (matched + receipt + Verifier) ≥ target; promises never count |
 
 ## Quick start
 
@@ -72,7 +114,8 @@ Then inspect what happened and why:
 uv run python -m apps.cli status INV-2297
 ```
 
-To start again from a clean world, stop `make sandbox` and run it again (it re-seeds).
+To start again from a clean world, stop `make sandbox` and run it again (it re-seeds the systems and
+clears the agent's runtime state and the simulator's memory).
 
 ## What happens in the demo
 
@@ -109,11 +152,11 @@ The sandbox clock is simulated: days pass in seconds. Every step is an event in 
 ## Repository layout
 
 ```
-core/            role-agnostic runtime: models, events, scheduler, pipeline, guards, LLM client
-agents/          primary agents: Operator, Conversation (domain-free)
-subagents/       Reply Classifier, Matcher (domain-free)
+core/            role-agnostic runtime: models, events, scheduler, pipeline, mission, guards, LLM client
+agents/          primary agents: Mission, Operator, Conversation (domain-free)
+subagents/       Prioritizer, Reply Classifier, Matcher, Document Generator (domain-free)
 tools/           tool registry, browser driver, channels, files, ERP connector, vault, app maps
-apps/            runtime wiring, flows, settlement, orchestrator, CLI
+apps/            runtime wiring, flows, settlement, orchestrator, mission runner, documents, CLI
 packs/roles/collections/            the job: pipeline, guards, timers, task types, prompts
 packs/companies/sharma_distributors/ the company: app maps, channels, facts it may state
 sandbox/         the fake company: ERP, bank portal, message hub, drive, customer simulator
@@ -151,7 +194,8 @@ All served by Groq's OpenAI-compatible API; change any role in [config/models.ya
 | Role | Model |
 |---|---|
 | Operator, Conversation | `openai/gpt-oss-120b` (reasoning: medium) |
-| Mission, Verifier (Day 2) | `openai/gpt-oss-120b` (reasoning: high) |
+| Mission | `openai/gpt-oss-120b` (reasoning: high) |
+| Verifier (Day 2 midday) | `openai/gpt-oss-120b` (reasoning: high) |
 | Reply Classifier, light sub-agents | `qwen/qwen3.8-27b` |
 | Customer simulator | `qwen/qwen3.8-27b` (a different family from the agents, so evals stay honest) |
 | Injection guard (Day 2) | `meta-llama/llama-prompt-guard-2-86m` |
@@ -170,6 +214,10 @@ uv run python -m apps.cli step                                   # one pass: inb
 uv run python -m apps.cli status INV-2297                        # an invoice's timeline and evidence
 uv run python -m apps.cli entities                               # invoices in the mission + timers
 uv run python -m apps.cli events [-n 30]                         # event log + hash-chain check
+uv run python -m apps.cli mission new "<brief>"                  # Mission Agent: spec + scope + plan
+uv run python -m apps.cli mission show|board|plan|approve|tick   # inspect, (re)plan, approve, one tick
+uv run python -m apps.cli mission answer "<text>"                # answer the agent's blocking questions
+uv run python -m apps.cli mission run [--days 5] [--sim-llm]     # tick daily with simulated customers
 uv run python -m sandbox.customer_sim tick [--llm]               # simulated customers act
 uv run python -m sandbox.customer_sim advance 1d                 # move simulated time
 ```
@@ -180,9 +228,12 @@ uv run python -m sandbox.customer_sim advance 1d                 # move simulate
 make test
 ```
 
-216 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
-bank servers, and an end-to-end acceptance test (`tests/apps/test_end_to_end.py`) that runs the real
-Operator loop, browser, systems, simulator, matcher, verifier and guards with scripted LLM decisions.
+235 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
+simulator, matcher, verifier and guards with scripted LLM decisions:
+`tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
+mission week from the brief: already-paid invoice settled before any chase, one transfer for three
+invoices, a partial payment, a look-alike payer never matched, zero false "paid").
 No network or API key is needed for the test suite.
 
 ## Known limitations (so far)
@@ -192,6 +243,11 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 2+).** Mission Agent and batch planning, Policy Gate and approvals, injection
-  guard screening, follow-up cadence, chaos/recovery scenarios, workspace UI, eval harness.
+- **Not built yet (Day 2+).** Policy Gate (quiet hours, contact caps) and the Approval Broker (payment-plan
+  requests are recorded as `approval.requested` events for now), injection guard screening,
+  chaos/recovery scenarios, workspace UI, eval harness.
+- The forecast uses fixed per-state probabilities from the role pack until memory supplies real history.
+- A new promise from a customer who is already `PROMISED` (e.g. a later date after a reminder) is
+  classified and logged but does not yet replace the old promise date (Day 2 afternoon: replan).
+- A customer whose invoices were settled before their batch still takes a slot in that day's capacity.
 - Sandbox only: real bank portals have MFA and device binding; production should use bank APIs.

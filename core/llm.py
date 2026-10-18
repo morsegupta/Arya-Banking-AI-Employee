@@ -30,7 +30,7 @@ from pydantic import BaseModel, ValidationError
 T = TypeVar("T", bound=BaseModel)
 
 # Provider error codes meaning "the model produced malformed output"; a fresh sample usually works.
-MODEL_OUTPUT_ERRORS = {"tool_use_failed", "output_parse_failed"}
+MODEL_OUTPUT_ERRORS = {"tool_use_failed", "output_parse_failed", "json_validate_failed"}
 RESAMPLES = 2
 
 

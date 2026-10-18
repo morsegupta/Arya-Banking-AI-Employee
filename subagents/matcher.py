@@ -4,11 +4,14 @@ A record matches an entity only if the record's counterparty resolves to the
 entity's counterparty. Then, in order of strength:
   1. reference match: the entity's reference number appears in the record;
      one record may cover several referenced entities if the amounts add up;
-     a smaller amount is a partial settlement of one entity.
+     a smaller amount is a partial settlement of one entity, or, across several
+     referenced entities, is allocated oldest first (the last one partially).
   2. amount-only match: no reference, but exactly one open entity of that
      counterparty has the same amount (within tolerance).
-Anything else is left unmatched for a human: a same-amount record from a
-similarly named but different counterparty must never match.
+  3. amount-sum match: no reference, but exactly one set of two or more open
+     entities of that counterparty adds up to the amount.
+Anything else is left unmatched for a human: amounts above what is due, ambiguous sums, and
+a same-amount record from a similarly named but different counterparty.
 Records already applied (in `applied`) are skipped, so money is never counted twice.
 """
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
+from itertools import combinations
 
 STOPWORDS = {"PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "CO", "COMPANY", "THE", "AND", "M", "S", "MS", "INC", "CORP"}
 
@@ -35,6 +39,7 @@ class Candidate:
     ref: str                # entity reference, e.g. "ABC-2291"
     counterparty: str
     amount_due: int         # minor units
+    due_on: date | None = None   # allocation order: oldest first
 
 
 @dataclass
@@ -45,7 +50,8 @@ class Match:
     matched_amount: int
     counterparty_matches: bool
     reference_matches: bool
-    kind: str               # "reference" | "reference_multi" | "reference_partial" | "amount_only"
+    kind: str               # reference | reference_multi | reference_partial | reference_multi_partial
+                            # | amount_only | amount_sum
     record_text: str
     reasons: list[str] = field(default_factory=list)
 
@@ -81,6 +87,40 @@ def reference_in(ref: str, record_text: str) -> bool:
     return re.search(rf"(?<!\d){re.escape(number)}(?!\d)", record_text) is not None
 
 
+def allocate(amount: int, dues: list[int], tolerance: int = 0) -> list[int]:
+    """Split `amount` over `dues` in order: each gets min(due, what is left). Within tolerance of the
+    total, everyone is settled in full (rounding differences are absorbed)."""
+    if abs(sum(dues) - amount) <= tolerance:
+        return list(dues)
+    out, left = [], amount
+    for d in dues:
+        part = max(0, min(d, left))
+        out.append(part)
+        left -= part
+    return out
+
+
+MAX_SUBSET_ITEMS = 12
+
+
+def unique_subset(amount: int, cands: list[Candidate], tolerance: int) -> list[Candidate] | None:
+    """The only set of 2+ candidates whose dues add up to `amount`, else None (none, or ambiguous)."""
+    if len(cands) < 2 or len(cands) > MAX_SUBSET_ITEMS:
+        return None
+    found = None
+    for k in range(2, len(cands) + 1):
+        for combo in combinations(cands, k):
+            if abs(sum(c.amount_due for c in combo) - amount) <= tolerance:
+                if found is not None:
+                    return None
+                found = list(combo)
+    return found
+
+
+def _oldest_first(cands: list[Candidate]) -> list[Candidate]:
+    return sorted(cands, key=lambda c: (c.due_on or date.max, c.ref))
+
+
 def match(records: list[Record], candidates: list[Candidate], *, tolerance: int,
           applied: set[str] | None = None) -> list[Match]:
     applied = applied or set()
@@ -95,10 +135,17 @@ def match(records: list[Record], candidates: list[Candidate], *, tolerance: int,
         referenced = [c for c in mine if reference_in(c.ref, rec.text)]
         if referenced:
             total = sum(c.amount_due for c in referenced)
-            if len(referenced) > 1 and abs(total - rec.amount) <= tolerance:
-                for c in referenced:
-                    out.append(Match(c.entity_id, rec.id, rec.on, c.amount_due, True, True, "reference_multi",
-                                     rec.text, [f"one record covers {len(referenced)} referenced entities"]))
+            if len(referenced) > 1 and rec.amount <= total + tolerance:
+                full = abs(total - rec.amount) <= tolerance
+                ordered = _oldest_first(referenced)
+                for c, part in zip(ordered, allocate(rec.amount, [c.amount_due for c in ordered], tolerance)):
+                    if part <= 0:
+                        continue
+                    why = [f"one record covers {len(referenced)} referenced entities"]
+                    if not full:
+                        why.append(f"short of their total ({rec.amount} < {total}): allocated oldest first")
+                    out.append(Match(c.entity_id, rec.id, rec.on, part, True, True,
+                                     "reference_multi" if full else "reference_multi_partial", rec.text, why))
                     taken.add(c.entity_id)
                 continue
             if len(referenced) == 1:
@@ -117,4 +164,14 @@ def match(records: list[Record], candidates: list[Candidate], *, tolerance: int,
             out.append(Match(c.entity_id, rec.id, rec.on, c.amount_due, True, False, "amount_only", rec.text,
                              ["no reference in record; unique open amount for this counterparty"]))
             taken.add(c.entity_id)
+            continue
+        if same_amount:
+            continue        # several open entities with this amount: ambiguous, leave for a human
+        subset = unique_subset(rec.amount, mine, tolerance)
+        if subset:
+            for c in _oldest_first(subset):
+                out.append(Match(c.entity_id, rec.id, rec.on, c.amount_due, True, False, "amount_sum", rec.text,
+                                 [f"no reference in record; the only set of {len(subset)} open entities "
+                                  "of this counterparty that adds up to the amount"]))
+                taken.add(c.entity_id)
     return out

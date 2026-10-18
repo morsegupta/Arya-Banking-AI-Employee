@@ -7,7 +7,7 @@ events; for now the CLI calls them directly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -116,35 +116,62 @@ class OutreachOutcome:
     ok: bool
     channel: str | None
     message: dict[str, Any] | None
-    transition: TransitionResult | None
+    transition: TransitionResult | None          # first entity's transition (single-entity callers)
     attempts: list[str]
+    transitions: list[TransitionResult] = field(default_factory=list)
 
 
-async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str = "outreach1",
+def group_facts(rt: Runtime, loaded: list[LoadedEntity]) -> dict[str, Any]:
+    """Facts for one message covering several entities of one counterparty: the facts they share once,
+    the rest per item, and the total of the money facts."""
+    if len(loaded) == 1:
+        return conversation_facts(rt, loaded[0])
+    per_item = [conversation_facts(rt, item) for item in loaded]
+    shared = {k: v for k, v in per_item[0].items() if all(p.get(k) == v for p in per_item)}
+    items = [{k: v for k, v in p.items() if k not in shared} for p in per_item]
+    src = role_cfg(rt)["entity_source"]
+    totals = {f"total_{k}": format_money(sum(int(i.facts.get(k) or 0) for i in loaded))
+              for k in src.get("money_facts", [])}
+    return {**shared, "items": items, "item_count": len(items), **totals}
+
+
+def group_key(entities: list[Entity]) -> str:
+    return "+".join(sorted(e.id for e in entities))
+
+
+async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], *, step: str = "outreach1",
                    purpose: str | None = None, transition_to: str | None = "CONTACTED",
-                   extra_facts: dict[str, Any] | None = None) -> OutreachOutcome:
-    """Draft and send one message, falling back across channels; optionally move the entity."""
+                   extra_facts: dict[str, Any] | None = None, extra_documents: list[str] | None = None,
+                   channels: list[str] | None = None) -> OutreachOutcome:
+    """Draft and send one message about one entity, or several entities of the same counterparty,
+    falling back across channels; optionally move every entity it covers."""
     cfg = role_cfg(rt)["outreach"]
-    loaded = await load_entity(rt, mission_id, external_ref)
+    refs = [external_ref] if isinstance(external_ref, str) else list(external_ref)
+    loaded = [await load_entity(rt, mission_id, ref) for ref in refs]
+    contact = loaded[0].contact
+    if any(item.contact != contact for item in loaded[1:]):
+        raise ValueError(f"one message can only cover one counterparty: {refs}")
     agent = ConversationAgent(rt.llm, role_prompt=role_prompt(rt, "conversation"),
                               signature=rt.company_cfg["channels"].get("signature", ""))
-    facts, cfacts = {**conversation_facts(rt, loaded), **(extra_facts or {})}, company_facts(rt)
+    facts, cfacts = {**group_facts(rt, loaded), **(extra_facts or {})}, company_facts(rt)
+    documents = [d for item in loaded for d in item.documents] + list(extra_documents or [])
+    entities = [item.entity for item in loaded]
+    key = loaded[0].entity.id if len(loaded) == 1 else group_key(entities)
     attempts: list[str] = []
     budget = Budget(40_000)
-    for channel in cfg["channel_order"]:
-        to = loaded.contact.get(channel)
+    for channel in channels or cfg["channel_order"]:
+        to = contact.get(channel)
         if not to:
             attempts.append(f"{channel}: no address")
             continue
         try:
             turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"], entity_facts=facts,
-                                     company_facts=cfacts, documents=loaded.documents, budget=budget)
+                                     company_facts=cfacts, documents=documents, budget=budget)
         except (DraftRejected, LLMError) as exc:
             attempts.append(f"{channel}: draft rejected: {exc}")
             continue
-        ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded.entity.id, allowed_apps={channel},
-                         idempotency_key=f"{mission_id}:{loaded.entity.id}:{step}:{channel}",
-                         artifacts_dir=rt.artifacts_dir)
+        ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id, allowed_apps={channel},
+                         idempotency_key=f"{mission_id}:{key}:{step}:{channel}", artifacts_dir=rt.artifacts_dir)
         args = {"to": turn.to, "body": turn.body, "attachments": turn.attachments}
         if turn.subject:
             args["subject"] = turn.subject
@@ -155,12 +182,20 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str, *, step: str
                 continue                     # L2 fallback: next channel
             break
         attempts.append(f"{channel}: delivered {res.output['id']}")
-        if transition_to is None:
-            return OutreachOutcome(True, channel, res.output, None, attempts)
-        tr = rt.pipeline.propose(loaded.entity.id, transition_to,
-                                 {"outreach": {"delivered": True, "message_id": res.output["id"],
-                                               "channel": channel, "thread_id": res.output["thread_id"]}},
-                                 facts={"last_outreach": {"channel": channel, "message_id": res.output["id"],
-                                                          "thread_id": res.output["thread_id"]}})
-        return OutreachOutcome(True, channel, res.output, tr, attempts)
+        sent = {"channel": channel, "message_id": res.output["id"], "thread_id": res.output["thread_id"]}
+        transitions = []
+        for e in entities:
+            if transition_to is None:
+                rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
+                continue
+            current = rt.pipeline.get(e.id).state
+            if transition_to not in rt.pipeline.allowed_targets(current):
+                rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
+                continue
+            transitions.append(rt.pipeline.propose(
+                e.id, transition_to, {"outreach": {"delivered": True, **sent}},
+                facts={"last_outreach": {**sent, "group": [x.external_ref for x in entities]}}))
+            rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
+        return OutreachOutcome(True, channel, res.output, transitions[0] if transitions else None, attempts,
+                               transitions)
     return OutreachOutcome(False, None, None, None, attempts)

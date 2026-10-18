@@ -2,13 +2,17 @@
 
     python -m sandbox.seed [--world evals/worlds/sharma_default.yaml]
 
-Wipes and rebuilds var/: clock, ERP, bank portal, message hub, shared drive.
+Wipes and rebuilds var/: clock, ERP, bank portal, message hub, shared drive. Also clears the
+customer simulator's memory and the agent runtime's state (events, entities, missions, settlement
+ledger): they describe the old world, and a stale ledger would hide bank lines from a new mission.
 Running it twice gives byte-identical ERP data and documents (evals depend on this).
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
+from pathlib import Path
 
 from sandbox.bank_portal import db as bank_db
 from sandbox.common import clock, config
@@ -19,7 +23,15 @@ from sandbox.erp import db as erp_db
 from sandbox.message_hub import db as hub_db
 
 
+def reset_state() -> None:
+    var = config.var_dir()
+    shutil.rmtree(var / "runtime", ignore_errors=True)
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{var / 'sim.db'}{suffix}").unlink(missing_ok=True)
+
+
 def seed_all(world: World) -> dict:
+    reset_state()
     clock.set_now(world.start)
     erp_db.seed(world)
     bank_db.seed(world)

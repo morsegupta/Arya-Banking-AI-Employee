@@ -8,6 +8,10 @@
     python -m apps.cli demo INV-2297 [--days 5] [--sim-llm]
     python -m apps.cli entities
     python -m apps.cli events [-n 30]
+
+    python -m apps.cli mission new "Collect the 45+ day overdue invoices - target 12L by Friday"
+    python -m apps.cli mission show | answer "<text>" | plan | approve | reject "<reason>" | tick | board
+    python -m apps.cli mission run [--days 5] [--sim-llm]     tick daily with simulated customers
 """
 
 from __future__ import annotations
@@ -189,6 +193,132 @@ async def cmd_demo(args) -> None:
         await rt.close()
 
 
+# --- missions ----------------------------------------------------------------------------------
+
+def _current_file(rt):
+    return rt.artifacts_dir.parent / "current_mission"
+
+
+def _mission_id(rt, args) -> str:
+    if args.id:
+        return args.id
+    f = _current_file(rt)
+    if not f.exists():
+        raise SystemExit("no current mission: run `mission new \"<brief>\"` first or pass --id")
+    return f.read_text().strip()
+
+
+def _show(runner) -> None:
+    from apps.mission import plan_text
+    for line in plan_text(runner.mission, format_money):
+        print(line)
+
+
+def _board(runner) -> None:
+    p = runner.progress()
+    target = format_money(p.target) if p.target is not None else "-"
+    print(f"  verified {format_money(p.verified)} of {target}   expected {format_money(p.expected)}"
+          + (f"   gap {format_money(p.gap)}" if p.gap is not None else ""))
+    for row in runner.group_rows():
+        items = ", ".join(f"{i['ref']} {i['state']}" + (f" (promised {i['promise_date']})" if i.get("promise_date")
+                                                        else "") for i in row["items"])
+        print(f"  {row['group']:<4} {row['name'][:24]:<24} {format_money(row['open_value']):>15}  {items}")
+
+
+def _flush_runner(runner, printed: int) -> int:
+    for line in runner.log[printed:]:
+        print("  " + line)
+    return len(runner.log)
+
+
+async def cmd_mission(args) -> None:
+    from apps.mission import MissionRunner
+    rt = build_runtime(use_llm=args.action not in {"show", "board", "approve"})
+    try:
+        if args.action == "new":
+            runner = MissionRunner(rt)
+            try:
+                await runner.create(args.text)
+            finally:
+                if runner.mission_id:
+                    _current_file(rt).write_text(runner.mission_id)
+                _flush_runner(runner, 0)
+            _show(runner)
+            if runner.mission.status == "AWAITING_PLAN_APPROVAL":
+                print("\nApprove with: uv run python -m apps.cli mission approve")
+            return
+        runner = MissionRunner(rt, _mission_id(rt, args))
+        if args.action == "show":
+            _show(runner)
+        elif args.action == "board":
+            _show(runner)
+            _board(runner)
+        elif args.action == "answer":
+            await runner.answer(args.text)
+            _flush_runner(runner, 0)
+            _show(runner)
+        elif args.action == "approve":
+            runner.approve(by=args.by)
+            _flush_runner(runner, 0)
+        elif args.action == "reject":
+            await runner.reject(args.text)
+            _flush_runner(runner, 0)
+            _show(runner)
+        elif args.action == "plan":
+            await runner.plan()
+            _flush_runner(runner, 0)
+            _show(runner)
+        elif args.action == "tick":
+            await runner.tick()
+            _flush_runner(runner, 0)
+            _board(runner)
+        elif args.action == "run":
+            await _run_mission(rt, runner, args)
+        if rt.llm and rt.llm.calls:
+            print(f"LLM calls: {len(rt.llm.calls)}, tokens: {sum(c['total_tokens'] for c in rt.llm.calls)}")
+    finally:
+        await rt.close()
+
+
+async def _run_mission(rt, runner, args) -> None:
+    """Tick once per simulated day. Also drives the SIMULATED customers and sandbox clock (demo only)."""
+    from datetime import timedelta
+
+    from sandbox.common import clock as sandbox_clock
+    from sandbox.common.world import load_world
+    from sandbox.customer_sim.__main__ import _voice
+    from sandbox.customer_sim.engine import SimEngine
+
+    voice = _voice(args.sim_llm)
+    sim = SimEngine(load_world(), "http://127.0.0.1:8103", "http://127.0.0.1:8102", voice=voice)
+    printed = 0
+    try:
+        for day in range(args.days):
+            print(f"== {sandbox_clock.now():%a %d %b %Y %H:%M}")
+            if day:                                    # day 0: nothing has been sent yet
+                world = await sim.tick()
+                for r in world["replies"]:
+                    print(f"  [world] {r['customer']} replied ({r['decision']}) about {r['invoices']}")
+                for p in world["payments"]:
+                    print(f"  [world] {p['customer']} paid {format_money(p['amount_paise'])} UTR {p['utr']}")
+            result = await runner.tick()
+            if day == 0:                               # same-day replies to the first batch
+                world = await sim.tick()
+                for r in world["replies"]:
+                    print(f"  [world] {r['customer']} replied ({r['decision']}) about {r['invoices']}")
+                result = await runner.tick()
+            printed = _flush_runner(runner, printed)
+            _board(runner)
+            if result["status"] not in {"ACTIVE"}:
+                print(f"mission {result['status']}")
+                break
+            sandbox_clock.advance(timedelta(days=1))
+    finally:
+        await sim.close()
+        if hasattr(voice, "close"):
+            await voice.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="arya")
     p.add_argument("--mission", default=MISSION)
@@ -210,12 +340,20 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("entities")
     ev = sub.add_parser("events")
     ev.add_argument("-n", type=int, default=30)
+    mi = sub.add_parser("mission")
+    mi.add_argument("action", choices=["new", "show", "board", "answer", "plan", "approve", "reject", "tick", "run"])
+    mi.add_argument("text", nargs="?", default="")
+    mi.add_argument("--id", default=None)
+    mi.add_argument("--by", default="finance_manager")
+    mi.add_argument("--days", type=int, default=5)
+    mi.add_argument("--sim-llm", action="store_true")
     args = p.parse_args(argv)
     from sandbox.common import config
     from sandbox.common.runlock import Busy, run_lock
     handler = {"fetch": cmd_fetch, "statement": cmd_statement, "outreach": cmd_outreach, "step": cmd_step,
-               "status": cmd_status, "demo": cmd_demo, "entities": cmd_entities, "events": cmd_events}[args.cmd]
-    if args.cmd in {"entities", "events", "status"}:      # read-only
+               "status": cmd_status, "demo": cmd_demo, "entities": cmd_entities, "events": cmd_events,
+               "mission": cmd_mission}[args.cmd]
+    if args.cmd in {"entities", "events", "status"} or (args.cmd == "mission" and args.action in {"show", "board"}):
         asyncio.run(handler(args))
         return
     try:

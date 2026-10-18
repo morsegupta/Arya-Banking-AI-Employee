@@ -104,8 +104,11 @@ def candidates(rt: Runtime, mission_id: str) -> list[tuple[Entity, Candidate]]:
     out = []
     for state in cfg["states"]:
         for e in rt.pipeline.list(mission_id, state):
-            name = e.data.get("record", {}).get(cfg["counterparty_field"], "")
-            out.append((e, Candidate(e.id, e.external_ref, name, int(e.data.get("balance", e.value)))))
+            record = e.data.get("record", {})
+            due = record.get(cfg.get("order_field", ""))
+            out.append((e, Candidate(e.id, e.external_ref, record.get(cfg["counterparty_field"], ""),
+                                     int(e.data.get("balance", e.value)),
+                                     date.fromisoformat(due) if isinstance(due, str) else None)))
     return out
 
 
@@ -216,7 +219,8 @@ async def settle(rt: Runtime, mission_id: str, statement_path: str) -> list[Sett
         report = await verify(rt, mission_id, entity, m, receipt)
         ctx = {**m.guard_context(), "erp": {"receipt_exists": True, "receipt_id": receipt["id"]},
                "verifier": {"pass": report.passed}}
-        target = "PAID" if m.kind != "reference_partial" else "PARTIALLY_PAID"
+        balance = int(entity.data.get("balance", entity.value))
+        target = "PAID" if m.matched_amount >= balance - tol else "PARTIALLY_PAID"
         tr = rt.pipeline.propose(entity.id, target, ctx, facts={
             "settlement": {"record_id": m.record_id, "amount": m.matched_amount, "receipt_id": receipt["id"],
                            "on": m.record_on.isoformat()}})

@@ -54,6 +54,7 @@ class Runtime:
     pipeline: Pipeline
     llm: LLMClient | None
     artifacts_dir: Path
+    drive_dir: Path | None = None
     _closers: list[Any] = field(default_factory=list)
 
     async def close(self) -> None:
@@ -111,4 +112,4 @@ def build_runtime(*, role: str = "collections", company: str = "sharma_distribut
     return Runtime(role=role, company=company, role_dir=role_dir, company_dir=company_dir, company_cfg=cfg,
                    db=db, events=events, bus=bus, clock=clock, scheduler=scheduler, vault=vault,
                    registry=registry, sessions=sessions, pipeline=pipeline, llm=llm,
-                   artifacts_dir=var / "runtime" / "artifacts", _closers=[hub, erp])
+                   artifacts_dir=var / "runtime" / "artifacts", drive_dir=roots.drive_root, _closers=[hub, erp])

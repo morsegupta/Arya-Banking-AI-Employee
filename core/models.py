@@ -51,6 +51,36 @@ class MissionSpec(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
 
 
+class PlanBatch(BaseModel):
+    """A group of entities the mission works on together, starting on a given day."""
+    name: str
+    groups: list[str]               # counterparty / group ids, in priority order
+    approach: str                   # one of the role pack's approaches
+    start_day: int = Field(0, ge=0)  # days after the mission becomes ACTIVE
+    rationale: str = ""
+
+
+class MissionPlan(BaseModel):
+    summary: str
+    batches: list[PlanBatch]
+    expected_value: int | None = None   # code-computed forecast at planning time
+    risks: list[str] = Field(default_factory=list)
+    human_asks: list[str] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)   # what code had to correct in the agent's plan
+
+
+class NextAction(BaseModel):
+    lever: str                      # one of the role pack's levers
+    groups: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
+class TickDecision(BaseModel):
+    assessment: str
+    actions: list[NextAction] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+
+
 class Mission(BaseModel):
     id: str = Field(default_factory=lambda: new_id("mis"))
     role: str                       # role pack name
@@ -58,6 +88,9 @@ class Mission(BaseModel):
     brief: str
     status: MissionStatus = MissionStatus.DRAFT
     spec: MissionSpec | None = None
+    plan: MissionPlan | None = None
+    selection: dict[str, Any] = Field(default_factory=dict)   # entity selection parameters (validated)
+    data: dict[str, Any] = Field(default_factory=dict)        # runtime bookkeeping (activated_at, batches sent...)
     created_at: datetime
 
 

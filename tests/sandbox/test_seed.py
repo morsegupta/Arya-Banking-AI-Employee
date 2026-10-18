@@ -124,3 +124,13 @@ def test_reseed_is_deterministic(sandbox_var, world):
     before = digest()
     seed_all(world)
     assert digest() == before
+
+
+def test_reseed_clears_runtime_and_simulator_state(sandbox_var, world):
+    from sandbox.seed import seed_all
+
+    (sandbox_var / "runtime").mkdir(exist_ok=True)
+    (sandbox_var / "runtime" / "runtime.db").write_text("stale ledger")
+    (sandbox_var / "sim.db").write_text("stale cursors")
+    seed_all(world)
+    assert not (sandbox_var / "runtime").exists() and not (sandbox_var / "sim.db").exists()
