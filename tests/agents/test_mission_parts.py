@@ -199,3 +199,13 @@ def test_follow_ups_respect_the_cadence():
                                                                                  groups=["A", "B", "C"])]),
                                 groups=groups, levers=levers)
     assert d.actions[0].groups == ["B", "C"] and "contacted 0 day(s) ago" in d.problems[0]
+
+
+def test_retry_only_for_groups_whose_first_contact_failed():
+    groups = [{"group": "A", "states": ["OVERDUE"], "first_contact_failed": True},
+              {"group": "B", "states": ["OVERDUE"], "first_contact_failed": False}]
+    levers = {"retry_contact": {"states": ["OVERDUE"], "requires": "first_contact_failed"}}
+    d = MissionAgent.check_tick(TickProposal(assessment="x", actions=[NextAction(lever="retry_contact",
+                                                                                 groups=["A", "B"])]),
+                                groups=groups, levers=levers)
+    assert d.actions[0].groups == ["A"] and "does not have first_contact_failed" in d.problems[0]

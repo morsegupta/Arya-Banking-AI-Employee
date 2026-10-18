@@ -157,7 +157,7 @@ What is decided by the model and what by code:
 | Rank | — | Prioritizer: value × age × risk per customer; approach rules from the role pack |
 | Plan | batches, approach, order, rationale | known customers only, each once, ≤ capacity per day, anything forgotten appended |
 | Approve | — | human only (`AWAITING_PLAN_APPROVAL → ACTIVE`) |
-| Daily review | assessment + levers (follow-up, statement, escalate, payment plan…) | only role-pack levers, only for customers in the states a lever applies to, never sooner after the last contact than the lever's cadence (follow-up 3 days); payment plans → approval request |
+| Daily review | assessment + levers (follow-up, statement, escalate, payment plan…) | only role-pack levers, only for customers in the states a lever applies to, never sooner after the last contact than the lever's cadence (follow-up 3 days), retry only where a first contact really failed; payment plans → approval request |
 | Complete | — | only when **verified** money (matched + receipt + Verifier) ≥ target; promises never count |
 
 ## Quick start
@@ -341,7 +341,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-283 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+286 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole

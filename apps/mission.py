@@ -331,6 +331,7 @@ class MissionRunner:
         for e in self.rt.pipeline.list(self.mission_id):
             by.setdefault(self._group_of(e), []).append(e)
         names = {g: d["name"] for g, d in self.mission.data.get("groups", {}).items()}
+        failed = self._failed_first_contacts()
         rows = []
         for gid, ents in by.items():
             items = []
@@ -338,14 +339,32 @@ class MissionRunner:
                 f = e.data.get("facts", {})
                 items.append({"ref": e.external_ref, "state": e.state, "open": int(e.data.get("balance", e.value)),
                               **({"promise_date": f["promise_date"]} if f.get("promise_date") else {})})
-            contacts = [(e.data.get("last_contact") or {}).get("at") for e in ents]
+            contacts = [self._last_contact_at(e) for e in ents]
             last = max((c for c in contacts if c), default=None)
             days = (self._today() - datetime.fromisoformat(last).date()).days if last else None
             rows.append({"group": gid, "name": names.get(gid, ""), "states": sorted({e.state for e in ents}),
                          "open_value": sum(i["open"] for i in items if i["state"] not in
                                            self.rt.pipeline.spec.terminal), "items": items,
-                         "days_since_contact": days})
+                         "days_since_contact": days,
+                         "first_contact_failed": gid in failed and any(e.state in self.rt.pipeline.spec.initial
+                                                                       for e in ents)})
         return sorted(rows, key=lambda r: -r["open_value"])
+
+    def _failed_first_contacts(self) -> set[str]:
+        """Groups whose latest contact attempt failed on every channel (and none succeeded after it)."""
+        last: dict[str, bool] = {}
+        for e in self.rt.events.query(mission_id=self.mission_id, types=["mission.group_contacted"], limit=100000):
+            last[e.payload.get("group")] = bool(e.payload.get("ok"))
+        return {g for g, ok in last.items() if not ok}
+
+    def _last_contact_at(self, e: Entity) -> str | None:
+        """When we last reached out about this entity: the contact's own timestamp, or (for contacts
+        recorded before timestamps existed) the evidence stored when it was sent."""
+        at = (e.data.get("last_contact") or {}).get("at")
+        if at:
+            return at
+        sent = [x["at"] for x in self.rt.evidence.for_entity(e.id) if x["subject"].startswith("contact:")]
+        return max(sent, default=None)
 
     # --- tick -------------------------------------------------------------------------------------------
 

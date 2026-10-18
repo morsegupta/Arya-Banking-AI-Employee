@@ -204,6 +204,7 @@ mission:
     retry_contact:
       description: "Contact a customer whose first message failed (all channels), trying again now."
       states: [OVERDUE]
+      requires: first_contact_failed   # not for customers simply not reached yet: the plan's batches do that
     follow_up:
       description: "Send a follow-up on the next channel to a customer who has not replied."
       states: [CONTACTED]

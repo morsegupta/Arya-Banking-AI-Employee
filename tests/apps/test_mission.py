@@ -240,3 +240,45 @@ def test_day0_group_without_approved_wording_is_not_sent(make_runtime, asgi):
         assert any("C02" in line and "awaiting approved wording" in line for line in r.log)
     finally:
         asyncio.run(rt.close())
+
+
+def test_retry_contact_needs_a_failed_first_contact(make_runtime):
+    from core.models import Event
+    review = {"assessment": "Big balances not reached.", "actions": [
+        {"lever": "retry_contact", "groups": ["C03", "C12"], "rationale": "not contacted yet"}]}
+
+    def llm(messages):
+        return review if "TASK: review" in messages[0]["content"] else router(messages)
+
+    rt = make_runtime(ScriptedLLM([llm] * 100))
+    r = MissionRunner(rt)
+    try:
+        asyncio.run(r.create(BRIEF))
+        r.approve(by="test")
+        r.orch._set_kv("last_sync", rt.clock.now().date().isoformat())
+        rt.events.append(Event(type="mission.group_contacted", mission_id=r.mission_id, occurred_at=rt.clock.now(),
+                               payload={"group": "C12", "ok": False, "attempts": ["email: bounced", "whatsapp: down"]}))
+        rows = {g["group"]: g for g in r.group_rows()}
+        assert rows["C12"]["first_contact_failed"] and not rows["C03"]["first_contact_failed"]
+        decision = asyncio.run(r.review(r.progress()))
+        assert [(a.lever, a.groups) for a in decision.actions] == [("retry_contact", ["C12"])]
+        assert any("C03 does not have first_contact_failed" in p for p in decision.problems)
+    finally:
+        asyncio.run(rt.close())
+
+
+def test_contacts_without_a_timestamp_use_the_evidence_time(make_runtime):
+    rt = make_runtime(ScriptedLLM([router] * 50))
+    r = MissionRunner(rt)
+    try:
+        asyncio.run(r.create(BRIEF))
+        r.approve(by="test")
+        r.orch._set_kv("last_sync", rt.clock.now().date().isoformat())
+        asyncio.run(r.tick())
+        e = next(x for x in rt.pipeline.list(r.mission_id) if x.external_ref == "INV-2291")
+        old_style = {k: v for k, v in e.data["last_contact"].items() if k != "at"}   # recorded before timestamps
+        rt.pipeline.update_data(e.id, {"last_contact": old_style})
+        rows = {g["group"]: g for g in r.group_rows()}
+        assert rows["C01"]["days_since_contact"] == 0, "falls back to when the contact evidence was stored"
+    finally:
+        asyncio.run(rt.close())
