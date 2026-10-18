@@ -14,11 +14,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from apps.flows import conversation_facts, outreach, role_cfg
+from datetime import timedelta
+from pathlib import Path
+
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+
+from agents.verifier_agent import FuzzyCriterion, VerifierAgent
+from apps.flows import conversation_facts, outreach, role_cfg, role_prompt
 from apps.runtime import Runtime
 from apps.settlement import Settled, download_statement, lookback, settle
+from core.injection import redacted
 from core.llm import Budget, LLMError
-from core.models import Entity, Event
+from core.models import CriterionResult, Entity, Event, Evidence, VerificationReport
 from subagents.matcher import allocate
 from subagents.reply_classifier import ReplyClassifier
 from tools.base import RunContext
@@ -32,7 +40,9 @@ class Orchestrator:
         self.rt, self.mission_id = rt, mission_id
         rt.db.ensure_schema(KV_SCHEMA)
         cfg = role_cfg(rt)["reply_classifier"]
-        self.classifier = ReplyClassifier(rt.llm, cfg["intents"], minor_units=cfg.get("minor_units", 100))
+        self.classifier = ReplyClassifier(rt.llm, cfg["intents"], minor_units=cfg.get("minor_units", 100),
+                                          tokenizer=rt.tokenizer)
+        self.verifier = VerifierAgent(rt.llm, role_prompt=role_prompt(rt, "verifier"))
         self.sync_requested = False
         self.log: list[str] = []
         rt.bus.subscribe("timer.", self.on_timer)
@@ -117,10 +127,15 @@ class Orchestrator:
             self._event("message.unrouted", message_id=msg["id"], sender=msg["from_addr"])
             self._say(f"message {msg['id']} from {msg['from_addr']} not linked to an entity (needs a human)")
             return {"message": msg["id"], "entity": None}
+        refs_txt = ",".join(e.external_ref for e in routed)
+        if not msg.get("released"):
+            attached = await self.attachment_texts(msg)
+            screening = await self.rt.guard.screen("\n".join([msg.get("subject") or "", msg["body"], *attached]))
+            if screening.flagged:
+                return self.quarantine_message(msg, routed, screening)
         summaries = [{"ref": e.external_ref,
                       **{k: v for k, v in conversation_facts(self.rt, _Loaded(e)).items()
                          if k in {"customer_name", "balance_paise", "due_date"}}} for e in routed]
-        refs_txt = ",".join(e.external_ref for e in routed)
         try:
             c = await self.classifier.classify(msg["body"], entities=summaries, today=self.rt.clock.now().date(),
                                                budget=Budget(20_000))
@@ -142,6 +157,13 @@ class Orchestrator:
             self.sync_requested = True      # a claim triggers a bank check; it never moves the entity itself
         if c.intent == "doc_request" and targets:
             await self.send_documents(targets, msg)
+        if c.intent == "bank_detail_change":
+            return await self.suspected_fraud(msg, targets or routed, c, ctx)
+        if c.intent == "discount_request" and targets:
+            self.request_concession(msg, targets, c)
+        if c.intent == "promise_to_pay":
+            report = await self.verify_promise(targets[0] if targets else routed[0], msg, c)
+            ctx["verifier"] = {"pass": report.passed}
 
         shares: list[int | None] = [None] * len(targets)
         if c.intent == "promise_to_pay" and c.amount_minor:
@@ -167,10 +189,130 @@ class Orchestrator:
                 if target == current or target not in self.rt.pipeline.allowed_targets(current):
                     continue
                 tr = self.rt.pipeline.propose(e.id, target, ctx, facts=facts)
+                if tr.ok and c.quote:
+                    self.rt.evidence.collect([Evidence(kind="message", ref=msg["id"], summary=c.quote,
+                                                       data={"from": msg["from_addr"], "channel": msg["channel"],
+                                                             "intent": c.intent, "confidence": c.confidence})],
+                                             subject=f"transition:{target}", mission_id=self.mission_id,
+                                             entity_id=e.id)
                 results.append(f"{e.external_ref}:{tr.from_state}->{tr.to_state}:{'ok' if tr.ok else 'refused'}")
                 self._say(f"{e.external_ref}: {tr.from_state} -> {target} "
                           + ("ok" if tr.ok else f"refused ({tr.reason}: {tr.guard.failures() if tr.guard else ''})"))
         return {"message": msg["id"], "entity": refs_txt, "intent": c.intent, "moves": results}
+
+    # --- trust: injection, fraud, concessions, promise verification ------------------------------
+
+    async def attachment_texts(self, msg: dict) -> list[str]:
+        """Text of a message's attachments (PDFs, text files), so they are screened with the message.
+        Files that cannot be read as text are noted; no agent can read them either."""
+        out = []
+        ctx = RunContext(mission_id=self.mission_id, task_id=f"screen-{msg['id']}", allowed_apps={msg["channel"]},
+                         artifacts_dir=self.rt.artifacts_dir)
+        for att in msg.get("attachments") or []:
+            res = await self.rt.registry.invoke(f"{msg['channel']}.attachment",
+                                                {"message_id": msg["id"], "filename": att["filename"]}, ctx)
+            if not res.ok:
+                self._event("message.attachment_unscreened", message_id=msg["id"], filename=att["filename"],
+                            error=res.error)
+                continue
+            path = Path(res.output["path"])
+            try:
+                if path.suffix.lower() == ".pdf":
+                    out.append("\n".join(p.extract_text() or "" for p in PdfReader(path).pages))
+                elif path.suffix.lower() in {".txt", ".csv", ".md", ".html", ".json", ".xml"}:
+                    out.append(path.read_text(errors="replace"))
+                else:
+                    self._event("message.attachment_unscreened", message_id=msg["id"], filename=att["filename"],
+                                error="not a text document")
+            except (PdfReadError, OSError, ValueError) as exc:
+                self._event("message.attachment_unscreened", message_id=msg["id"], filename=att["filename"],
+                            error=str(exc)[:200])
+        return out
+
+    def quarantine_message(self, msg: dict, routed: list[Entity], screening) -> dict[str, Any]:
+        """Text that tries to instruct the AI never reaches an agent. The entities it concerns are
+        quarantined (every write or message about them needs a human) and a human reviews it."""
+        reason = f"message {msg['id']} looks like a prompt-injection attempt"
+        for e in routed:
+            self.rt.gate.quarantine(f"entity:{e.id}", reason, screening.score)
+            self._event("security.injection_suspected", e, message_id=msg["id"], sender=msg["from_addr"],
+                        screening=screening.as_dict(), agent_view=redacted(msg["body"], screening))
+        a = self.rt.approvals.request(
+            key=f"review:{msg['id']}", kind="decision", mission_id=self.mission_id, entity_id=routed[0].id,
+            title=f"Review a quarantined message from {msg['from_addr']} about "
+                  f"{', '.join(e.external_ref for e in routed)}",
+            payload={"action": "review_quarantine", "entity_ids": [e.id for e in routed], "message": msg,
+                     "screening": screening.as_dict(),
+                     "question": "Approve = the message is genuine: release it to the agents. "
+                                 "Reject = keep it quarantined and hand the account to a human."})
+        self._say(f"{','.join(e.external_ref for e in routed)}: message {msg['id']} QUARANTINED "
+                  f"(score {screening.score:.2f}, {screening.pattern_hits or 'classifier'}); review {a.id}")
+        return {"message": msg["id"], "entity": ",".join(e.external_ref for e in routed), "quarantined": a.id}
+
+    async def suspected_fraud(self, msg: dict, entities: list[Entity], c, ctx: dict) -> dict[str, Any]:
+        """'Our/your bank details changed' is never acted on: escalate, and restate the official details."""
+        for e in entities:
+            self._event("security.fraud_suspected", e, message_id=msg["id"], sender=msg["from_addr"], quote=c.quote)
+            for target in ("ACKNOWLEDGED", "ESCALATED"):
+                current = self.rt.pipeline.get(e.id).state
+                if target in self.rt.pipeline.allowed_targets(current):
+                    self.rt.pipeline.propose(e.id, target, ctx, facts={"escalation_reason":
+                                                                       "message asking to pay different account details"})
+        self.rt.events.append(Event(type="handoff.requested", mission_id=self.mission_id, occurred_at=self.rt.clock.now(),
+                                    payload={"refs": [e.external_ref for e in entities], "message_id": msg["id"],
+                                             "reason": "possible payment-redirection fraud"}))
+        out = await outreach(self.rt, self.mission_id, [e.external_ref for e in entities], step=f"fraud:{msg['id']}",
+                             transition_to=None, channels=[msg["channel"]],
+                             purpose="The customer was told our bank details changed. They have NOT changed and "
+                                     "never change by message. Restate the official bank details from COMPANY_FACTS, "
+                                     "ask them to pay only to that account, and say our team will call to confirm.")
+        self._say(f"{','.join(e.external_ref for e in entities)}: SUSPECTED FRAUD (bank detail change) -> escalated; "
+                  f"official details restated ({'; '.join(out.attempts)})")
+        return {"message": msg["id"], "entity": ",".join(e.external_ref for e in entities), "intent": c.intent,
+                "fraud": True}
+
+    def request_concession(self, msg: dict, entities: list[Entity], c) -> None:
+        a = self.rt.approvals.request(
+            key=f"concession:{msg['id']}", kind="decision", mission_id=self.mission_id, entity_id=entities[0].id,
+            title=f"{', '.join(e.external_ref for e in entities)}: customer asks for a concession",
+            payload={"action": "concession", "entity_ids": [e.id for e in entities], "quote": c.quote,
+                     "message_id": msg["id"], "channel": msg["channel"],
+                     "grants_phrases": ["discount", "waive", "waiver"], "grants_on_reject": True,
+                     "question": f"The customer wrote: {c.quote!r}. Approve the concession they ask for?",
+                     "reply": {"approved": "Tell the customer the finance manager approved the concession they asked "
+                                           "for, exactly as they asked (quote it), and ask for the payment date.",
+                               "rejected": "Politely tell the customer we cannot offer a discount on this invoice, "
+                                           "and ask for a payment date for the full balance."}})
+        self._say(f"{','.join(e.external_ref for e in entities)}: concession requested -> approval {a.id}")
+
+    async def verify_promise(self, entity: Entity, msg: dict, c) -> VerificationReport:
+        """Deterministic checks on the promise; a second, independent LLM opinion only for borderline cases."""
+        cfg = role_cfg(self.rt).get("verification", {}).get("promise", {})
+        today = self.rt.clock.now().date()
+        horizon = today + timedelta(days=cfg.get("max_days_ahead", 60))
+        checks = [
+            CriterionResult(criterion="the supporting quote appears verbatim in the message", passed=bool(c.quote)),
+            CriterionResult(criterion="an amount is committed", passed=bool(c.amount_minor and c.amount_minor > 0)),
+            CriterionResult(criterion="the date is today or later", passed=bool(c.date and c.date >= today)),
+            CriterionResult(criterion=f"the date is within {cfg.get('max_days_ahead', 60)} days",
+                            passed=bool(c.date and c.date <= horizon))]
+        fuzzy = []
+        if c.confidence < cfg.get("second_opinion_below", 0.9):
+            tok = self.rt.tokenizer()
+            fuzzy.append(FuzzyCriterion(
+                criterion="The message is a firm commitment to pay the stated amount by the stated date "
+                          "(not conditional, not 'we will try', not a question).",
+                evidence=tok.tokenize(msg["body"]),
+                context={"amount": c.amount_minor, "date": c.date.isoformat() if c.date else None}))
+        try:
+            report = await self.verifier.verify(entity.id, checks, fuzzy, budget=Budget(10_000))
+        except LLMError as exc:
+            report = VerificationReport(subject_id=entity.id, passed=False, confidence=0.0, criteria=[
+                *checks, CriterionResult(criterion="second opinion", passed=False, note=f"verifier unavailable: {exc}")])
+        self.rt.events.append(Event(type="verification.completed", mission_id=self.mission_id, entity_id=entity.id,
+                                    occurred_at=self.rt.clock.now(),
+                                    payload={"subject": "promise", **report.model_dump(mode="json")}))
+        return report
 
     # --- actions on a counterparty's group of entities -------------------------------------------
 

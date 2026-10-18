@@ -15,14 +15,17 @@ Bounded ReAct loop (architecture §6.2):
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from core.clock import Clock
 from core.events import EventStore
+from core.injection import redacted
 from core.llm import Budget, BudgetExceeded, LLMClient, LLMError, ToolUseFailed
 from core.models import Event, Evidence, FailureReport, Task, TaskResult, TaskStatus, ToolResult
+from core.pii import Tokenizer, UnknownToken
 from tools.base import RunContext, ToolRegistry
 
 SYSTEM = """You are the Operator of an AI employee. You complete ONE bounded task by operating the company's
@@ -87,8 +90,13 @@ def _render_result(call_id: str, result: ToolResult) -> str:
 class OperatorAgent:
     def __init__(self, llm: LLMClient, registry: ToolRegistry, events: EventStore, clock: Clock, *,
                  role_prompt: str = "", app_notes: dict[str, list[str]] | None = None,
-                 artifacts_dir: Path | str = "var/runtime/artifacts", config: OperatorConfig | None = None):
+                 artifacts_dir: Path | str = "var/runtime/artifacts", config: OperatorConfig | None = None,
+                 screen: Callable[[str], Awaitable[Any]] | None = None,
+                 on_flag: Callable[[Task, Any], None] | None = None,
+                 tokenizer: Callable[[], Tokenizer] | None = None):
         self.llm, self.registry, self.events, self.clock = llm, registry, events, clock
+        self.screen, self.on_flag = screen, on_flag    # injection guard over untrusted observations
+        self.tokenizer = tokenizer                     # personal/account data shown to the model as placeholders
         self.role_prompt, self.app_notes = role_prompt, app_notes or {}
         self.artifacts_dir = Path(artifacts_dir)
         self.cfg = config or OperatorConfig()
@@ -97,12 +105,14 @@ class OperatorAgent:
         self.events.append(Event(type=type_, mission_id=task.mission_id, entity_id=task.entity_id, task_id=task.id,
                                  occurred_at=self.clock.now(), payload=payload))
 
-    def _messages(self, task: Task, context: dict[str, Any]) -> list[dict[str, Any]]:
+    def _messages(self, task: Task, context: dict[str, Any], tok: Tokenizer | None = None) -> list[dict[str, Any]]:
         notes = [f"- {app}: {n}" for app in task.apps for n in self.app_notes.get(app, [])]
         system = SYSTEM + (f"\n\nRole guidance:\n{self.role_prompt}" if self.role_prompt else "") \
             + (f"\n\nNotes about the apps:\n" + "\n".join(notes) if notes else "")
         user = {"task": task.goal, "success_criteria": task.success_criteria, "apps": task.apps,
                 "context": context, "now": self.clock.now().isoformat()}
+        if tok:
+            user = tok.tokenize_obj(user)           # string values only: numbers (amounts) stay numbers
         return [{"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(user, default=str, ensure_ascii=False)}]
 
@@ -117,9 +127,10 @@ class OperatorAgent:
                   budget: Budget | None = None) -> TaskResult | FailureReport:
         budget = budget or Budget(self.cfg.task_token_budget)
         ctx = RunContext(mission_id=task.mission_id, task_id=task.id, entity_id=task.entity_id,
-                         allowed_apps=set(task.apps), artifacts_dir=self.artifacts_dir)
+                         allowed_apps=set(task.apps), artifacts_dir=self.artifacts_dir, write_scope=task.write_scope)
         tools = self.registry.specs(set(task.apps)) + CONTROL_TOOLS
-        messages = self._messages(task, context or {})
+        tok = self.tokenizer() if self.tokenizer else None
+        messages = self._messages(task, context or {}, tok)
         results: dict[str, ToolResult] = {}
         tried: list[str] = []
         nudges = 0
@@ -165,7 +176,13 @@ class OperatorAgent:
                         continue
                     task.status = TaskStatus.COMPLETED
                     evidence: list[Evidence] = [e for i in ids for e in results[i].evidence]
-                    out = TaskResult(task_id=task.id, summary=str(call.arguments.get("summary", "")),
+                    summary = str(call.arguments.get("summary", ""))
+                    if tok:
+                        try:
+                            summary = tok.detokenize(summary)
+                        except UnknownToken:
+                            pass
+                    out = TaskResult(task_id=task.id, summary=summary,
                                      outputs={i: results[i].output for i in ids}, evidence=evidence)
                     self._event(task, "task.completed", summary=out.summary, result_call_ids=ids, steps=step,
                                 tokens=budget.used, evidence=[e.model_dump() for e in evidence])
@@ -184,13 +201,33 @@ class OperatorAgent:
                     ctx.idempotency_key = f"{task.mission_id}:{task.entity_id or '-'}:{task.id}:{step}:{call.name}"
                 else:
                     ctx.idempotency_key = None
-                result = await self.registry.invoke(call.name, call.arguments, ctx)
+                args = call.arguments
+                if tok:
+                    try:
+                        args = tok.detokenize_obj(args)         # the model typed placeholders; code fills values
+                    except UnknownToken as exc:
+                        messages.append({"role": "tool", "tool_call_id": call.id,
+                                         "content": json.dumps({"ok": False, "error": f"{exc}; use placeholders "
+                                                                "exactly as shown"})})
+                        continue
+                result = await self.registry.invoke(call.name, args, ctx)
                 results[call.id] = result
                 tried.append(f"{call.name}({json.dumps(call.arguments, ensure_ascii=False)[:120]}) -> "
                              f"{'ok' if result.ok else result.error_kind}")
                 self._event(task, "task.step", step=step, tool=call.name, ok=result.ok,
                             error=result.error, call_id=call.id)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": _render_result(call.id, result)})
+                shown = result.model_copy(update={"output": tok.tokenize_obj(result.output)}) if tok else result
+                content = _render_result(call.id, shown)
+                if self.screen and result.ok and result.untrusted:
+                    screening = await self.screen(json.dumps(result.output, default=str, ensure_ascii=False))
+                    if screening.flagged:
+                        self._event(task, "security.injection_suspected", tool=call.name,
+                                    screening=screening.as_dict())
+                        if self.on_flag:
+                            self.on_flag(task, screening)
+                        content = json.dumps({"call_id": call.id, "ok": True, "output": redacted(content, screening),
+                                              "quarantined": True})
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
             self._compact(messages)
 
         return fail("max_actions", f"no result after {task.max_actions} steps")

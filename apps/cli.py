@@ -12,6 +12,8 @@
     python -m apps.cli mission new "Collect the 45+ day overdue invoices - target 12L by Friday"
     python -m apps.cli mission show | answer "<text>" | plan | approve | reject "<reason>" | tick | board
     python -m apps.cli mission run [--days 5] [--sim-llm]     tick daily with simulated customers
+
+    python -m apps.cli approvals [list|show|approve|reject] [id] [--by name] [--note text]
 """
 
 from __future__ import annotations
@@ -144,10 +146,16 @@ async def cmd_status(args) -> None:
                 print(f"  {ev.occurred_at:%a %d %b %H:%M}  {p['from']} -> {p['to']}  ({p['actor']})  "
                       f"facts={json.dumps(p['facts'], ensure_ascii=False, default=str)[:150]}")
             elif ev.type in {"entity.transition_refused", "message.classified", "settlement.matched",
-                             "verification.completed"}:
+                             "verification.completed", "security.injection_suspected", "security.fraud_suspected"}:
                 brief = {k: v for k, v in p.items() if k in {"to", "reason", "failed_clauses", "intent", "confidence",
                                                              "quote", "record_id", "kind", "passed"}}
                 print(f"  {ev.occurred_at:%a %d %b %H:%M}  {ev.type}  {json.dumps(brief, ensure_ascii=False)[:180]}")
+        items = rt.evidence.for_entity(e.id)
+        if items:
+            print("  evidence:")
+        for item in items:
+            print(f"    [{item['subject']}] {item['kind']} {item['ref']} — {item['summary'][:100]}"
+                  + (" (sha256 kept)" if item["sha256"] else ""))
     finally:
         await rt.close()
 
@@ -319,6 +327,47 @@ async def _run_mission(rt, runner, args) -> None:
             await voice.close()
 
 
+# --- approvals ---------------------------------------------------------------------------------
+
+def _approval_line(a) -> str:
+    return f"  {a.id}  {a.status:<9} {a.kind:<9} {a.requested_at:%a %d %b %H:%M}  {a.title}"
+
+
+async def cmd_approvals(args) -> None:
+    from apps.approvals import decide
+    rt = build_runtime(use_llm=args.action in {"approve", "reject"})
+    try:
+        if args.action == "list":
+            items = rt.approvals.list(status=None if args.all else "PENDING")
+            if not items:
+                print("  nothing waiting for a decision")
+            for a in items:
+                print(_approval_line(a))
+            return
+        if not args.id:
+            raise SystemExit("which approval? pass its id")
+        a = rt.approvals.get(args.id)
+        if args.action == "show":
+            print(_approval_line(a))
+            p = a.payload
+            if p.get("question"):
+                print(f"  question: {p['question']}")
+            if a.kind == "tool_call":
+                print(f"  held: {p['tool']} because {p['reason']}")
+                for k, v in p["args"].items():
+                    print(f"    {k}: {str(v)[:600]}")
+            if p.get("screening"):
+                print(f"  screening: {p['screening']}")
+                print("  (message withheld from the agents; read it in the message hub)")
+            if a.decided_by:
+                print(f"  decided by {a.decided_by} at {a.decided_at}: {a.note or ''}")
+            return
+        for line in await decide(rt, a.id, approve=args.action == "approve", by=args.by, note=args.note):
+            print("  " + line)
+    finally:
+        await rt.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="arya")
     p.add_argument("--mission", default=MISSION)
@@ -347,13 +396,22 @@ def main(argv: list[str] | None = None) -> None:
     mi.add_argument("--by", default="finance_manager")
     mi.add_argument("--days", type=int, default=5)
     mi.add_argument("--sim-llm", action="store_true")
+    ap = sub.add_parser("approvals")
+    ap.add_argument("action", nargs="?", default="list", choices=["list", "show", "approve", "reject"])
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--by", default="finance_manager")
+    ap.add_argument("--note", default="")
+    ap.add_argument("--all", action="store_true", help="include decided approvals")
     args = p.parse_args(argv)
     from sandbox.common import config
     from sandbox.common.runlock import Busy, run_lock
     handler = {"fetch": cmd_fetch, "statement": cmd_statement, "outreach": cmd_outreach, "step": cmd_step,
                "status": cmd_status, "demo": cmd_demo, "entities": cmd_entities, "events": cmd_events,
-               "mission": cmd_mission}[args.cmd]
-    if args.cmd in {"entities", "events", "status"} or (args.cmd == "mission" and args.action in {"show", "board"}):
+               "mission": cmd_mission, "approvals": cmd_approvals}[args.cmd]
+    read_only = (args.cmd in {"entities", "events", "status"}
+                 or (args.cmd == "mission" and args.action in {"show", "board"})
+                 or (args.cmd == "approvals" and args.action in {"list", "show"}))
+    if read_only:
         asyncio.run(handler(args))
         return
     try:

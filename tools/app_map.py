@@ -32,6 +32,9 @@ class AppMap(BaseModel):
     logout_path: str | None = None   # landing on login after this is intentional, not an expired session
     deny_paths: list[str] = Field(default_factory=list)          # never navigate/request these
     allowed_post_paths: list[str] = Field(default_factory=list)  # for read_only apps: the only non-GET requests allowed
+    # true: every write (non-GET besides login/logout) must match a write the current task was granted
+    # (path + form values), so a task can only make the exact change it was created for
+    scoped_writes: bool = False
     notes: list[str] = Field(default_factory=list)               # hints for the Operator (playbook seeds)
     exports: dict[str, Any] = Field(default_factory=dict)         # how to read files this app produces
 

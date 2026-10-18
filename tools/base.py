@@ -3,9 +3,10 @@
 Every tool call goes through ToolRegistry.invoke, which enforces, in order:
   1. the tool exists and the task's capability scope includes its app
   2. arguments validate against the tool's input schema
-  3. the Policy Gate allows it (pluggable; the real gate arrives on Day 2)
-  4. idempotency: non-idempotent tools need a key; a key that already
-     succeeded returns the stored result and the tool is NOT run again
+  3. idempotency: a key that already succeeded returns the stored result and the
+     tool is NOT run again (a replay changes nothing, so it needs no policy decision)
+  4. the Policy Gate allows it (core.policy; `ask` holds the call for a human, `defer` means not now);
+     non-idempotent tools need a key
   5. L0 retry with exponential backoff + jitter, for transient errors only
   6. the tool's own verify() check
   7. secret scrubbing, then an event for the audit trail
@@ -30,6 +31,7 @@ from pydantic import BaseModel, ValidationError
 from core.clock import Clock, SystemClock
 from core.events import EventStore
 from core.models import RISK_ORDER, Event, Risk, ToolKind, ToolResult
+from core.policy import PolicyDecision  # noqa: F401  (re-exported for tool code)
 from core.store import Database
 from tools.vault import Vault
 
@@ -70,6 +72,8 @@ class RunContext:
     entity_id: str | None = None
     idempotency_key: str | None = None          # required for non-idempotent tools: mission:entity:step
     artifacts_dir: Path = field(default_factory=lambda: Path("var/runtime/artifacts"))
+    # writes this task may make on apps with scoped writes: {app: [{"method", "path", "form": {field: value}}]}
+    write_scope: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def task_dir(self) -> Path:
         path = self.artifacts_dir / (self.task_id or "adhoc")
@@ -88,6 +92,8 @@ class Tool(ABC):
     dedupes_downstream: ClassVar[bool] = False  # passes the idempotency key to the remote system
     moves_money: ClassVar[bool] = False
     timeout_seconds: ClassVar[float] = 60.0
+    target_field: ClassVar[str | None] = None   # argument naming the person/system reached (contact caps)
+    content_fields: ClassVar[tuple[str, ...]] = ()  # free-text arguments the Policy Gate reads
 
     @abstractmethod
     async def run(self, args: BaseModel, ctx: RunContext) -> ToolResult: ...
@@ -98,13 +104,8 @@ class Tool(ABC):
 
 # --- policy hook ----------------------------------------------------------------------
 
-@dataclass
-class PolicyDecision:
-    action: Literal["allow", "deny", "ask"]
-    reason: str = ""
-
-
 PolicyCheck = Callable[[Tool, BaseModel, RunContext], Awaitable[PolicyDecision]]
+AfterSuccess = Callable[[Tool, BaseModel, RunContext, ToolResult], None]
 
 
 async def allow_all(tool: Tool, args: BaseModel, ctx: RunContext) -> PolicyDecision:
@@ -139,10 +140,12 @@ def spec_name(name: str) -> str:
 class ToolRegistry:
     def __init__(self, db: Database, events: EventStore, *, vault: Vault | None = None,
                  policy: PolicyCheck = allow_all, clock: Clock | None = None, max_attempts: int = 3,
-                 backoff_base: float = 0.5, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
+                 backoff_base: float = 0.5, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 after_success: list[AfterSuccess] | None = None):
         self.db, self.events = db, events
         self.vault = vault or Vault()
         self.policy = policy
+        self.after_success = after_success or []
         self.clock = clock or SystemClock()
         self.max_attempts, self.backoff_base, self._sleep = max_attempts, backoff_base, sleep
         self._tools: dict[str, Tool] = {}
@@ -190,9 +193,16 @@ class ToolRegistry:
         except ValidationError as exc:
             return self._fail(tool.name, ctx, "invalid_args", str(exc))
 
+        if not tool.idempotent and ctx.idempotency_key:
+            done = self._ledger_succeeded(tool, args, ctx.idempotency_key)
+            if done is not None:            # already happened: replaying sends nothing, so no policy question
+                return done
+
         decision = await self.policy(tool, args, ctx)
         if decision.action != "allow":
-            return self._fail(tool.name, ctx, "denied", f"policy {decision.action}: {decision.reason}")
+            detail = {"policy_action": decision.action, "rule": decision.rule, "approval_id": decision.approval_id,
+                      "retry_at": decision.retry_at.isoformat() if decision.retry_at else None}
+            return self._fail(tool.name, ctx, "denied", f"policy {decision.action}: {decision.reason}", detail)
 
         key = ctx.idempotency_key
         if not tool.idempotent:
@@ -213,6 +223,9 @@ class ToolRegistry:
         if not tool.idempotent:
             self._ledger_finish(key, result)
         self._record(tool, ctx, result)
+        if result.ok and not result.replayed:
+            for hook in self.after_success:
+                hook(tool, args, ctx, result)
         return result
 
     async def _run_with_retry(self, tool: Tool, args: BaseModel, ctx: RunContext) -> ToolResult:
@@ -236,6 +249,14 @@ class ToolRegistry:
         return last
 
     # idempotency ledger -----------------------------------------------------------------
+
+    def _ledger_succeeded(self, tool: Tool, args: BaseModel, key: str) -> ToolResult | None:
+        with self.db.read() as conn:
+            row = conn.execute("SELECT * FROM tool_calls WHERE idempotency_key = ?", (key,)).fetchone()
+        if row and row["status"] == "SUCCEEDED" and row["tool"] == tool.name \
+                and row["args_hash"] == _args_hash(tool.name, args):
+            return ToolResult.model_validate_json(row["result_json"]).model_copy(update={"replayed": True})
+        return None
 
     def _ledger_claim(self, tool: Tool, args: BaseModel, ctx: RunContext) -> ToolResult | None:
         """Claim the key. Returns a stored/blocking ToolResult if this call must not run."""
@@ -280,9 +301,11 @@ class ToolRegistry:
                      "evidence": [e.model_dump() for e in result.evidence]},
         ))
 
-    def _fail(self, name: str, ctx: RunContext, kind: str, error: str) -> ToolResult:
-        result = ToolResult(ok=False, error=error, error_kind=kind, attempts=0)  # type: ignore[arg-type]
+    def _fail(self, name: str, ctx: RunContext, kind: str, error: str,
+              policy: dict[str, Any] | None = None) -> ToolResult:
+        result = ToolResult(ok=False, error=error, error_kind=kind, attempts=0,  # type: ignore[arg-type]
+                            output={"policy": policy} if policy else None)
         self.events.append(Event(type="tool.rejected", mission_id=ctx.mission_id, entity_id=ctx.entity_id,
                                  task_id=ctx.task_id, occurred_at=self.clock.now(),
-                                 payload={"tool": name, "error_kind": kind, "error": error}))
+                                 payload={"tool": name, "error_kind": kind, "error": error, **(policy or {})}))
         return result

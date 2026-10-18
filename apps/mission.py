@@ -21,8 +21,9 @@ from agents.mission_agent import MissionAgent
 from apps.flows import _read, load_entity, outreach, role_cfg, role_prompt
 from apps.orchestrator import Orchestrator
 from apps.runtime import Runtime
-from apps.settlement import LEDGER_SCHEMA
+from apps.settlement import LEDGER_SCHEMA, fresh_verified_total
 from core.guards import compile_guard, evaluate
+from core.injection import redacted
 from core.llm import Budget, LLMError
 from core.mission import MissionStore, Progress, progress
 from core.models import Entity, Event, Mission, MissionPlan, MissionStatus, TickDecision
@@ -69,9 +70,19 @@ class MissionRunner:
         texts = []
         for path in self.rt.company_cfg.get("policy_docs", []):
             try:
-                texts.append((await _read(self.rt, "files.read_text", {"path": path}, self.mission_id))["text"])
+                text = (await _read(self.rt, "files.read_text", {"path": path}, self.mission_id))["text"]
             except RuntimeError as exc:
                 self._say(f"could not read policy {path}: {exc}")
+                continue
+            # a document on a shared drive is still untrusted: screen it before the Mission Agent reads it
+            screening = await self.rt.guard.screen(text)
+            if screening.flagged:
+                self.rt.events.append(Event(type="security.injection_suspected", mission_id=self.mission_id,
+                                            occurred_at=self.rt.clock.now(),
+                                            payload={"source": path, "screening": screening.as_dict()}))
+                self._say(f"policy document {path} looks tampered with (score {screening.score:.2f}); withheld")
+                text = redacted(text, screening)
+            texts.append(self.rt.tokenizer().tokenize(text))
         return "\n\n".join(texts)
 
     # --- understand ------------------------------------------------------------------------------
@@ -189,17 +200,34 @@ class MissionRunner:
                               "suggested_approach": g.approach} for g in groups},
             "scope_value": total}, event="mission.planned", payload=plan.model_dump(mode="json"))
         self.store.transition(m.id, S.AWAITING_PLAN_APPROVAL, actor="agent", reason="plan ready")
+        version = self.store.get(m.id).data.get("plan_version", 0) + 1
+        self.store.update(m.id, data={"plan_version": version})
+        self.rt.approvals.request(key=f"plan:{m.id}:{version}", kind="decision", mission_id=m.id,
+                                  title=f"Approve the plan for: {m.brief}",
+                                  payload={"action": "mission_plan", "summary": plan.summary,
+                                           "batches": [b.model_dump() for b in plan.batches],
+                                           "question": "Approve = start contacting customers as planned."})
         self._say(f"plan ready ({len(plan.batches)} batches); waiting for approval"
                   + (f" | code corrected: {plan.problems}" if plan.problems else ""))
         return self.mission
 
+    def _plan_approval(self):
+        version = self.mission.data.get("plan_version")
+        return self.rt.approvals.by_key(f"plan:{self.mission_id}:{version}") if version else None
+
     def approve(self, *, by: str = "finance_manager") -> Mission:
+        a = self._plan_approval()
+        if a and a.status == "PENDING":
+            self.rt.approvals.decide(a.id, approve=True, by=by)
         m = self.store.transition(self.mission_id, S.ACTIVE, actor="human", reason=f"plan approved by {by}")
         self.store.update(m.id, data={"activated_on": self._today().isoformat(), "approved_by": by})
         self._say(f"plan approved by {by}; mission ACTIVE")
         return self.mission
 
-    async def reject(self, reason: str) -> Mission:
+    async def reject(self, reason: str, *, by: str = "finance_manager") -> Mission:
+        a = self._plan_approval()
+        if a and a.status == "PENDING":
+            self.rt.approvals.decide(a.id, approve=False, by=by, note=reason)
         m = self.store.transition(self.mission_id, S.DRAFT, actor="human", reason=reason)
         self.store.update(m.id, data={"answers": [*m.data.get("answers", []), f"Plan rejected: {reason}"]})
         return await self.plan()
@@ -254,10 +282,19 @@ class MissionRunner:
         sent = await self.send_due_batches()
         prog = self.progress()
         if prog.target is not None and prog.verified >= prog.target:
-            self.store.transition(m.id, S.COMPLETED, actor="system", reason="target reached and verified",
-                                  verified_value=prog.verified)
-            self._say(f"TARGET REACHED: verified {prog.verified} >= {prog.target}; mission COMPLETED")
-            return {"status": S.COMPLETED, "progress": prog.as_dict(), "sent": sent}
+            fresh, ev, note = await fresh_verified_total(self.rt, m.id)
+            self.rt.events.append(Event(type="verification.completed", mission_id=m.id, occurred_at=self.rt.clock.now(),
+                                        payload={"subject": "mission", "ledger": prog.verified, "re_observed": fresh,
+                                                 "target": prog.target, "note": note,
+                                                 "passed": fresh >= prog.target}))
+            if fresh >= prog.target:
+                if ev:
+                    self.rt.evidence.collect([ev], subject="mission:completed", mission_id=m.id)
+                self.store.transition(m.id, S.COMPLETED, actor="system", reason="target reached and re-verified",
+                                      verified_value=fresh)
+                self._say(f"TARGET REACHED: {fresh} re-observed in the bank >= {prog.target}; mission COMPLETED")
+                return {"status": S.COMPLETED, "progress": prog.as_dict(), "sent": sent}
+            self._say(f"ledger says {prog.verified} but only {fresh} re-observed in the bank ({note}); not completed")
         decision = None
         if self.mission.data.get("last_review") != self._today().isoformat() and self._worth_review():
             decision = await self.review(prog)
@@ -292,6 +329,8 @@ class MissionRunner:
                 if gid in done:
                     continue
                 result = await self.contact_group(gid, batch.approach)
+                if result == "deferred":
+                    continue                    # policy: not now (quiet hours, contact cap); next tick retries
                 done.add(gid)
                 self.store.update(m.id, data={"contacted_groups": sorted(done)})
                 sent.append(f"{gid}:{result}")
@@ -317,6 +356,10 @@ class MissionRunner:
                                     occurred_at=self.rt.clock.now(),
                                     payload={"group": gid, "approach": approach, "refs": refs.split(","),
                                              "ok": out.ok, "channel": out.channel, "attempts": out.attempts}))
+        if out.held:
+            return "held"
+        if out.deferred_until:
+            return "deferred"
         return "sent" if out.ok else "failed"
 
     async def review(self, prog: Progress) -> TickDecision:
@@ -338,11 +381,21 @@ class MissionRunner:
     async def execute(self, lever: str, groups: list[str], rationale: str = "") -> str:
         spec = self.mcfg["levers"][lever]
         if spec.get("needs_approval"):
+            ids = []
             for gid in groups:
-                self.rt.events.append(Event(type="approval.requested", mission_id=self.mission_id,
-                                            occurred_at=self.rt.clock.now(),
-                                            payload={"lever": lever, "group": gid, "rationale": rationale}))
-            self._say(f"{lever} for {groups}: needs approval (requested)")
+                ents = [e for e in self.rt.pipeline.list(self.mission_id) if self._group_of(e) == gid
+                        and e.state not in self.rt.pipeline.spec.terminal]
+                if not ents:
+                    continue
+                a = self.rt.approvals.request(
+                    key=f"{lever}:{self.mission_id}:{gid}", kind="decision", mission_id=self.mission_id,
+                    entity_id=ents[0].id, title=f"{lever.replace('_', ' ')} for {gid}",
+                    payload={"action": spec.get("action", lever), "lever": lever, "group": gid,
+                             "entity_ids": [e.id for e in ents], "rationale": rationale,
+                             "grants_phrases": spec.get("grants_phrases", []),
+                             "question": f"{spec.get('description', lever)} Reason: {rationale}"})
+                ids.append(a.id)
+            self._say(f"{lever} for {groups}: needs approval ({', '.join(ids)})")
             return "approval requested"
         if lever == "check_bank":
             settled = await self.orch.bank_sync(force=True)

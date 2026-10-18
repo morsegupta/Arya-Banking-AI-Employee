@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from agents.verifier_agent import VerifierAgent
 from apps.flows import _read, role_cfg, run_task
 from apps.runtime import Runtime
 from core.models import CriterionResult, Entity, Event, Evidence, FailureReport, VerificationReport
@@ -129,8 +130,11 @@ async def post_receipt(rt: Runtime, mission_id: str, entity: Entity, m: Match) -
         goal = spec["goal_template"].format(ref=entity.external_ref, amount=f"{m.matched_amount / 100:.2f}",
                                             date=m.record_on.isoformat(), reference=m.record_id,
                                             mode=_mode(m.record_text))
+        # The task may submit exactly this receipt: the matcher's amount and bank reference, nothing else.
+        scope = {"erp_web": [{"method": "POST", "path": f"/invoices/{entity.external_ref}/receipts",
+                              "form": {"amount": f"{m.matched_amount / 100:.2f}", "reference": m.record_id}}]}
         res = await run_task(rt, mission_id, "post_receipt", goal=goal, entity_id=entity.id,
-                             success_criteria=spec.get("success_criteria", []))
+                             success_criteria=spec.get("success_criteria", []), write_scope=scope)
         rt.events.append(Event(type="settlement.receipt_task", mission_id=mission_id, entity_id=entity.id,
                                occurred_at=rt.clock.now(),
                                payload={"ok": not isinstance(res, FailureReport), "record_id": m.record_id,
@@ -139,28 +143,57 @@ async def post_receipt(rt: Runtime, mission_id: str, entity: Entity, m: Match) -
     return existing[0] if existing else None
 
 
-async def fresh_statement_has(rt: Runtime, mission_id: str, m: Match) -> tuple[bool, Evidence | None, str]:
-    """Verifier's own observation: new browser session, scripted (no LLM), statement for the record's date."""
-    task_id = f"verify-{m.entity_id}-{m.record_id}"
-    ctx = RunContext(mission_id=mission_id, task_id=task_id, entity_id=m.entity_id, allowed_apps={"bank_portal"},
+async def fresh_records(rt: Runtime, mission_id: str, start: date, end: date, task_id: str,
+                        entity_id: str | None = None) -> tuple[list[Record] | None, Evidence | None, str]:
+    """Verifier's own observation: new browser session, scripted (no LLM), statement CSV for a date range."""
+    ctx = RunContext(mission_id=mission_id, task_id=task_id, entity_id=entity_id, allowed_apps={"bank_portal"},
                      artifacts_dir=rt.artifacts_dir)
     try:
-        day = m.record_on.isoformat()
-        opened = await rt.registry.invoke("bank_portal.open", {"path": f"/statement?from_date={day}&to_date={day}"}, ctx)
+        opened = await rt.registry.invoke(
+            "bank_portal.open", {"path": f"/statement?from_date={start.isoformat()}&to_date={end.isoformat()}"}, ctx)
         if not opened.ok:
-            return False, None, f"could not open statement: {opened.error}"
+            return None, None, f"could not open statement: {opened.error}"
         link = next((e for e in opened.output["elements"] if e["name"] == "Download CSV"), None)
         if link is None:
-            return False, None, "no CSV link on the statement page"
+            return None, None, "no CSV link on the statement page"
         dl = await rt.registry.invoke("bank_portal.download", {"ref": link["ref"]}, ctx)
         if not dl.ok:
-            return False, None, f"download failed: {dl.error}"
+            return None, None, f"download failed: {dl.error}"
         mapping = load_app_maps(rt.company_dir / "apps")["bank_portal"].exports["statement_csv"]
-        rec = next((r for r in parse_statement(dl.output["path"], mapping) if r.id == m.record_id), None)
-        ok = rec is not None and rec.amount >= m.matched_amount
-        return ok, dl.evidence[0], "record found with sufficient amount" if ok else "record not in fresh statement"
+        return parse_statement(dl.output["path"], mapping), dl.evidence[0], "ok"
     finally:
         await rt.sessions.end_task(task_id)
+
+
+async def fresh_statement_has(rt: Runtime, mission_id: str, m: Match) -> tuple[bool, Evidence | None, str]:
+    records, ev, note = await fresh_records(rt, mission_id, m.record_on, m.record_on,
+                                            f"verify-{m.entity_id}-{m.record_id}", m.entity_id)
+    if records is None:
+        return False, None, note
+    rec = next((r for r in records if r.id == m.record_id), None)
+    ok = rec is not None and rec.amount >= m.matched_amount
+    return ok, ev, "record found with sufficient amount" if ok else "record not in fresh statement"
+
+
+async def fresh_verified_total(rt: Runtime, mission_id: str) -> tuple[int, Evidence | None, str]:
+    """Mission-level check: re-read the bank and sum the verified settlements whose money is really there.
+    A record covering several entities must hold at least the sum applied from it."""
+    rt.db.ensure_schema(LEDGER_SCHEMA)
+    with rt.db.read() as conn:
+        rows = conn.execute("SELECT s.record_id, SUM(s.amount) AS amount FROM settlements s JOIN entities e "
+                            "ON e.id = s.entity_id WHERE e.mission_id = ? AND s.status = 'VERIFIED' "
+                            "GROUP BY s.record_id", (mission_id,)).fetchall()
+    if not rows:
+        return 0, None, "nothing settled"
+    start, end = lookback(rt)
+    records, ev, note = await fresh_records(rt, mission_id, start, end, f"verify-mission-{mission_id}")
+    if records is None:
+        return 0, None, note
+    seen = {r.id: r.amount for r in records}
+    total = sum(r["amount"] for r in rows if seen.get(r["record_id"], 0) >= r["amount"])
+    missing = [r["record_id"] for r in rows if seen.get(r["record_id"], 0) < r["amount"]]
+    return total, ev, f"{len(rows) - len(missing)} of {len(rows)} records re-observed" + (
+        f"; missing {missing}" if missing else "")
 
 
 async def verify(rt: Runtime, mission_id: str, entity: Entity, m: Match, receipt: dict | None) -> VerificationReport:
@@ -179,10 +212,13 @@ async def verify(rt: Runtime, mission_id: str, entity: Entity, m: Match, receipt
     bal_ok = inv["balance_paise"] == max(expected, 0)
     criteria.append(CriterionResult(criterion="system of record balance reflects the settlement", passed=bal_ok,
                                     note=f"balance {inv['balance_paise']} expected {max(expected, 0)}"))
-    passed = all(c.passed for c in criteria)
-    report = VerificationReport(subject_id=entity.id, passed=passed, criteria=criteria, confidence=1.0 if passed else 0.0)
+    report = await VerifierAgent(rt.llm).verify(entity.id, criteria)       # all deterministic: no model asked
     rt.events.append(Event(type="verification.completed", mission_id=mission_id, entity_id=entity.id,
-                           occurred_at=rt.clock.now(), payload=report.model_dump(mode="json")))
+                           occurred_at=rt.clock.now(), payload={"subject": "settlement",
+                                                                **report.model_dump(mode="json")}))
+    if rt.evidence:
+        rt.evidence.collect([e for c in criteria for e in c.evidence], subject="verification",
+                            mission_id=mission_id, entity_id=entity.id)
     return report
 
 
@@ -226,6 +262,14 @@ async def settle(rt: Runtime, mission_id: str, statement_path: str) -> list[Sett
                            "on": m.record_on.isoformat()}})
         if tr.ok:
             ledger_set(rt, m, "VERIFIED")
+            if rt.evidence:
+                rt.evidence.collect([
+                    Evidence(kind="file", ref=statement_path, summary=f"statement with {m.record_id}"),
+                    Evidence(kind="record", ref=f"bank:{m.record_id}", summary=m.record_text,
+                             data={"amount": m.matched_amount, "kind": m.kind, "on": m.record_on.isoformat(),
+                                   "reasons": m.reasons}),
+                    Evidence(kind="record", ref=f"erp:{receipt['id']}", summary=f"receipt {receipt['id']}")],
+                    subject=f"transition:{target}", mission_id=mission_id, entity_id=entity.id)
             remaining = max(0, int(entity.data.get("balance", entity.value)) - m.matched_amount)
             rt.pipeline.update_data(entity.id, {"balance": remaining})
         results.append(Settled(entity.external_ref, m, receipt, report, tr))

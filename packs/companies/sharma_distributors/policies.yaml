@@ -1,0 +1,40 @@
+# Sharma Distributors: what Arya may do, when, and what needs a human (architecture §8.1).
+# Evaluated by code (core/policy.py) on every tool call; prompts are not trusted to enforce any of this.
+timezone: Asia/Kolkata
+
+tools:
+  by_risk:
+    irreversible: deny               # nothing Arya does may be impossible to undo
+  apps:
+    bank_portal:                     # read-only by construction; anything not listed is refused
+      allow: [bank_portal.open, bank_portal.snapshot, bank_portal.click, bank_portal.fill, bank_portal.select,
+              bank_portal.download, bank_portal.screenshot]
+    erp_web:                         # writes only in a task granted the exact receipt (matcher-approved)
+      writes_need_scope: true
+
+external_comm:
+  quiet_hours: "20:00-09:30"
+  weekdays_only: true
+  max_per_target: { count: 3, days: 7 }     # per email address / phone number
+  deny_phrases: [legal action, legal notice, lawyer, court, police, blacklist, blacklisted, CIBIL,
+                 credit bureau, credit score, defaulter]
+  approval_phrases: [discount, waive, waiver, write off, write-off, instalment, installment, payment plan,
+                     extension, interest waived]
+
+quarantine:
+  needs_approval: [write, external_comm, financial]
+
+injection:
+  threshold: 0.5
+  on_error: { messages: flag, observations: patterns }   # flag = fail closed; patterns = patterns only
+  patterns:                          # domain-specific attempts to change state by text
+    - "mark\\s+(INV[- ]?\\d+|(this|the|all)\\s+invoices?)\\s+(as\\s+)?(paid|settled|closed)"
+    - "stop\\s+(all\\s+)?(reminders|follow[- ]?ups|collections?)"
+    - "(update|change)\\s+(the\\s+)?(erp|ledger|records?)"
+    - "(transfer|send)\\s+(the\\s+)?(funds|money|payment)\\s+to"
+
+pii:                                 # replaced by {{pii:...}} tokens before any model sees text
+  email: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+  phone: "\\+?91[-\\s]?\\d{5}[-\\s]?\\d{5}"
+  account: "(?<![\\dA-Za-z])\\d{9,18}(?![\\dA-Za-z])"
+  ifsc: "\\b[A-Z]{4}0[A-Z0-9]{6}\\b"

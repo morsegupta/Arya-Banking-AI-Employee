@@ -23,7 +23,8 @@ import asyncio
 import hashlib
 from pathlib import Path
 from typing import Any, ClassVar
-from urllib.parse import urljoin, urlparse
+from decimal import Decimal, InvalidOperation
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 from playwright.async_api import Error as PlaywrightError
@@ -100,6 +101,16 @@ class Observation(BaseModel):
     notices: list[str] = Field(default_factory=list)   # driver messages to the model (e.g. re-login happened)
 
 
+def _same_value(got: str | None, want: Any) -> bool:
+    """Form values compared as numbers when both are numeric ('54000' == '54000.00'), else exactly."""
+    if got is None:
+        return False
+    try:
+        return Decimal(got.replace(",", "").strip()) == Decimal(str(want).replace(",", "").strip())
+    except InvalidOperation:
+        return got.strip() == str(want).strip()
+
+
 class BrowserDriver:
     """One task's browser: an isolated context and a single page."""
 
@@ -108,6 +119,8 @@ class BrowserDriver:
         self.page: Page | None = None
         self.blocked: list[str] = []
         self.relogins = 0
+        self.write_scope: dict[str, list[dict[str, Any]]] = {}   # set from the task's RunContext
+        self.writes_used: list[str] = []
 
     async def start(self) -> None:
         await self.context.route("**/*", self._guard)
@@ -121,7 +134,7 @@ class BrowserDriver:
     def app_for(self, url: str) -> AppMap | None:
         return next((a for a in self.apps.values() if a.owns(url)), None)
 
-    def violation(self, method: str, url: str) -> str | None:
+    def violation(self, method: str, url: str, body: str | None = None, *, consume: bool = True) -> str | None:
         if url.startswith(("about:", "data:", "blob:")):
             return None
         app = self.app_for(url)
@@ -132,11 +145,28 @@ class BrowserDriver:
             return f"{path} is deny-listed for {app.name}"
         if app.read_only and method != "GET" and path not in app.allowed_post_paths:
             return f"{app.name} is read-only: {method} {path} not allowed"
+        session_paths = {app.login.path if app.login else None, app.logout_path, *app.allowed_post_paths}
+        if app.scoped_writes and method != "GET" and path not in session_paths:
+            return self._scope_violation(app.name, method, path, body or "", consume=consume)
         return None
+
+    def _scope_violation(self, app: str, method: str, path: str, body: str, *, consume: bool) -> str | None:
+        form = {k: v[-1] for k, v in parse_qs(body, keep_blank_values=True).items()}
+        for i, grant in enumerate(self.write_scope.get(app, [])):
+            key = f"{app}:{i}"
+            if key in self.writes_used or grant.get("method", "POST") != method or grant["path"] != path:
+                continue
+            wrong = [f for f, want in grant.get("form", {}).items() if not _same_value(form.get(f), want)]
+            if wrong:
+                return f"{method} {path}: fields {wrong} differ from what this task may submit"
+            if consume:
+                self.writes_used.append(key)        # each granted write can happen once
+            return None
+        return f"{method} {path} is not a write this task was granted"
 
     async def _guard(self, route: Route) -> None:
         req = route.request
-        reason = self.violation(req.method, req.url)
+        reason = self.violation(req.method, req.url, req.post_data)
         if reason:
             self.blocked.append(f"{req.method} {urlparse(req.url).path}: {reason}")
             await route.abort("blockedbyclient")
@@ -211,6 +241,7 @@ class BrowserDriver:
         return await loc.evaluate("""el => ({tag: el.tagName.toLowerCase(), href: el.getAttribute('href'),
             submits: el.form ? [(el.form.getAttribute('method')||'get').toUpperCase(),
                                 el.form.getAttribute('action')||location.pathname] : null,
+            body: el.form ? new URLSearchParams(new FormData(el.form)).toString() : null,
             type: (el.getAttribute('type')||'').toLowerCase()})""")
 
     async def click(self, ref: str) -> Observation:
@@ -224,7 +255,7 @@ class BrowserDriver:
                 raise ToolDenied(reason)
         if info["submits"] and (info["tag"] == "button" or info["type"] == "submit"):
             method, action = info["submits"]
-            reason = self.violation(method, urljoin(before, action))
+            reason = self.violation(method, urljoin(before, action), info["body"], consume=False)
             if reason:
                 raise ToolDenied(reason)
         target = info["submits"][1] if info["submits"] else info["href"]
@@ -326,6 +357,7 @@ class BrowserSessions:
                 driver = BrowserDriver(context, self.apps, self.vault, ctx.task_dir())
                 await driver.start()
                 self._drivers[key] = driver
+            self._drivers[key].write_scope = ctx.write_scope
             return self._drivers[key]
 
     async def end_task(self, task_id: str) -> None:

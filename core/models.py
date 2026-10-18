@@ -128,6 +128,8 @@ class Task(BaseModel):
     goal: str
     success_criteria: list[str] = Field(default_factory=list)
     apps: list[str] = Field(default_factory=list)   # capability scope: only these apps' tools
+    # exact writes allowed on apps with scoped writes: {app: [{"method", "path", "form": {field: value}}]}
+    write_scope: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     status: TaskStatus = TaskStatus.RECEIVED
     attempts: int = 0
     max_actions: int = 40

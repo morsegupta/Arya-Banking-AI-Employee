@@ -16,7 +16,7 @@ from agents.conversation_agent import ConversationAgent, DraftRejected
 from agents.operator_agent import OperatorAgent
 from apps.runtime import Runtime
 from core.llm import Budget, LLMError
-from core.models import Entity, FailureReport, Task, TaskResult
+from core.models import Entity, Evidence, FailureReport, Task, TaskResult
 from core.pipeline import TransitionResult
 from tools.app_map import load_app_maps
 from tools.base import RunContext
@@ -52,16 +52,24 @@ def format_money(minor_units: int, symbol: str = "₹") -> str:
 
 def make_operator(rt: Runtime) -> OperatorAgent:
     notes = {name: m.notes for name, m in load_app_maps(rt.company_dir / "apps").items()}
+    def quarantine_task(task, screening) -> None:
+        rt.gate.quarantine(f"task:{task.id}", "a page or file in this task looked like a prompt-injection attempt",
+                           screening.score)
+
     return OperatorAgent(rt.llm, rt.registry, rt.events, rt.clock, role_prompt=role_prompt(rt, "operator"),
-                         app_notes=notes, artifacts_dir=rt.artifacts_dir)
+                         app_notes=notes, artifacts_dir=rt.artifacts_dir,
+                         screen=rt.obs_guard.screen if rt.obs_guard else None,
+                         on_flag=quarantine_task if rt.gate else None, tokenizer=rt.tokenizer)
 
 
 async def run_task(rt: Runtime, mission_id: str, task_type: str, goal: str | None = None,
                    success_criteria: list[str] | None = None, entity_id: str | None = None,
-                   context: dict[str, Any] | None = None) -> TaskResult | FailureReport:
+                   context: dict[str, Any] | None = None,
+                   write_scope: dict[str, list[dict[str, Any]]] | None = None) -> TaskResult | FailureReport:
     spec = role_cfg(rt)["task_types"][task_type]
     task = Task(mission_id=mission_id, entity_id=entity_id, type=task_type, goal=goal or spec["goal"],
-                success_criteria=success_criteria or [], apps=spec["apps"], max_actions=spec.get("max_actions", 15))
+                success_criteria=success_criteria or [], apps=spec["apps"], max_actions=spec.get("max_actions", 15),
+                write_scope=write_scope or {})
     try:
         return await make_operator(rt).run(task, context=context)
     finally:
@@ -119,6 +127,8 @@ class OutreachOutcome:
     transition: TransitionResult | None          # first entity's transition (single-entity callers)
     attempts: list[str]
     transitions: list[TransitionResult] = field(default_factory=list)
+    held: str | None = None              # approval id: a human must approve this exact message first
+    deferred_until: str | None = None    # policy: not now (quiet hours, contact cap); try again later
 
 
 def group_facts(rt: Runtime, loaded: list[LoadedEntity]) -> dict[str, Any]:
@@ -152,50 +162,75 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
     if any(item.contact != contact for item in loaded[1:]):
         raise ValueError(f"one message can only cover one counterparty: {refs}")
     agent = ConversationAgent(rt.llm, role_prompt=role_prompt(rt, "conversation"),
-                              signature=rt.company_cfg["channels"].get("signature", ""))
+                              signature=rt.company_cfg["channels"].get("signature", ""), tokenizer=rt.tokenizer)
     facts, cfacts = {**group_facts(rt, loaded), **(extra_facts or {})}, company_facts(rt)
     documents = [d for item in loaded for d in item.documents] + list(extra_documents or [])
     entities = [item.entity for item in loaded]
     key = loaded[0].entity.id if len(loaded) == 1 else group_key(entities)
     attempts: list[str] = []
     budget = Budget(40_000)
+    avoid: list[str] = []
     for channel in channels or cfg["channel_order"]:
         to = contact.get(channel)
         if not to:
             attempts.append(f"{channel}: no address")
             continue
-        try:
-            turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"], entity_facts=facts,
-                                     company_facts=cfacts, documents=documents, budget=budget)
-        except (DraftRejected, LLMError) as exc:
-            attempts.append(f"{channel}: draft rejected: {exc}")
+        for _ in range(2):                    # a draft refused for its wording is rewritten once
+            try:
+                turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"],
+                                         entity_facts=facts, company_facts=cfacts, documents=documents,
+                                         budget=budget, avoid=avoid)
+            except (DraftRejected, LLMError) as exc:
+                attempts.append(f"{channel}: draft rejected: {exc}")
+                turn = None
+                break
+            ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id,
+                             allowed_apps={channel}, idempotency_key=f"{mission_id}:{key}:{step}:{channel}",
+                             artifacts_dir=rt.artifacts_dir)
+            args = {"to": turn.to, "body": turn.body, "attachments": turn.attachments}
+            if turn.subject:
+                args["subject"] = turn.subject
+            res = await rt.registry.invoke(f"{channel}.send", args, ctx)
+            policy = (res.output or {}).get("policy") if not res.ok and isinstance(res.output, dict) else None
+            if policy and policy["policy_action"] == "deny" and policy["rule"].endswith("deny_phrases") and not avoid:
+                avoid = list(rt.policies.get("external_comm", {}).get("deny_phrases", []))
+                attempts.append(f"{channel}: wording refused by policy, redrafting")
+                continue
+            break
+        if turn is None:
             continue
-        ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id, allowed_apps={channel},
-                         idempotency_key=f"{mission_id}:{key}:{step}:{channel}", artifacts_dir=rt.artifacts_dir)
-        args = {"to": turn.to, "body": turn.body, "attachments": turn.attachments}
-        if turn.subject:
-            args["subject"] = turn.subject
-        res = await rt.registry.invoke(f"{channel}.send", args, ctx)
         if not res.ok:
             attempts.append(f"{channel}: {res.error_kind}: {res.error}")
+            if policy and policy["policy_action"] == "ask":
+                rt.approvals.annotate(policy["approval_id"], {"continuation": {
+                    "kind": "outreach", "mission_id": mission_id, "entity_ids": [e.id for e in entities],
+                    "transition_to": transition_to, "step": step, "channel": channel}})
+                return OutreachOutcome(False, channel, None, None, attempts, held=policy["approval_id"])
+            if policy and policy["policy_action"] == "defer":
+                return OutreachOutcome(False, channel, None, None, attempts, deferred_until=policy["retry_at"])
             if res.error_kind == "permanent":
                 continue                     # L2 fallback: next channel
             break
         attempts.append(f"{channel}: delivered {res.output['id']}")
         sent = {"channel": channel, "message_id": res.output["id"], "thread_id": res.output["thread_id"]}
-        transitions = []
-        for e in entities:
-            if transition_to is None:
-                rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
-                continue
-            current = rt.pipeline.get(e.id).state
-            if transition_to not in rt.pipeline.allowed_targets(current):
-                rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
-                continue
-            transitions.append(rt.pipeline.propose(
-                e.id, transition_to, {"outreach": {"delivered": True, **sent}},
-                facts={"last_outreach": {**sent, "group": [x.external_ref for x in entities]}}))
-            rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
+        transitions = apply_sent(rt, entities, sent, transition_to=transition_to, step=step)
         return OutreachOutcome(True, channel, res.output, transitions[0] if transitions else None, attempts,
                                transitions)
     return OutreachOutcome(False, None, None, None, attempts)
+
+
+def apply_sent(rt: Runtime, entities: list[Entity], sent: dict[str, Any], *, transition_to: str | None,
+               step: str) -> list[TransitionResult]:
+    """After a message really went out: remember it on each entity and propose the transition."""
+    transitions = []
+    for e in entities:
+        if transition_to is not None and transition_to in rt.pipeline.allowed_targets(rt.pipeline.get(e.id).state):
+            transitions.append(rt.pipeline.propose(
+                e.id, transition_to, {"outreach": {"delivered": True, **sent}},
+                facts={"last_outreach": {**sent, "group": [x.external_ref for x in entities]}}))
+        rt.pipeline.update_data(e.id, {"last_contact": {**sent, "step": step}})
+        if rt.evidence:
+            rt.evidence.collect([Evidence(kind="message", ref=sent["message_id"],
+                                          summary=f"{step} sent by {sent['channel']}", data=sent)],
+                                subject=f"contact:{step}", mission_id=e.mission_id, entity_id=e.id)
+    return transitions

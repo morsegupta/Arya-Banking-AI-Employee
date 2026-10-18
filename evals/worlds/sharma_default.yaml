@@ -8,7 +8,7 @@
 # so the agent can never read them.
 
 world_id: sharma_default
-start: "2026-10-19T09:00:00+05:30"   # Monday. Mission week ends Friday 2026-10-23.
+start: "2026-10-19T10:00:00+05:30"   # Monday, after contact hours open (09:30). Mission week ends Friday 2026-10-23.
 
 company:
   name: Sharma Distributors Pvt Ltd

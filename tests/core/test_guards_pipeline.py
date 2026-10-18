@@ -99,7 +99,7 @@ def contacted(pipe):
 
 
 PROMISE_CTX = {"classifier": {"intent": "promise_to_pay", "confidence": 0.93},
-               "evidence": {"quote": "We will transfer on 22 Oct"}}
+               "evidence": {"quote": "We will transfer on 22 Oct"}, "verifier": {"pass": True}}
 
 
 def test_promise_guard_and_timers(pipe):
@@ -171,3 +171,10 @@ def test_role_pack_validation(tmp_path):
     bad.write_text("entity: x\npipeline:\n  states: [A]\n  initial: [A]\n  transitions:\n    - {from: A, to: B}\n")
     with pytest.raises(ValueError, match="unknown state 'B'"):
         load_pipeline(bad)
+
+
+def test_promise_needs_the_verifier(pipe):
+    e = contacted(pipe)
+    ctx = {**PROMISE_CTX, "verifier": {"pass": False}}
+    r = pipe.propose(e.id, "PROMISED", ctx, facts={"promise_amount": 340000_00, "promise_date": "2026-10-22"})
+    assert not r.ok and "verifier.pass == true" in r.guard.failures()

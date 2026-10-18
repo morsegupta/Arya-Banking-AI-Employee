@@ -25,7 +25,8 @@ pipeline:
     - from: [CONTACTED, ACKNOWLEDGED]
       to: PROMISED
       guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
-                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ] }
+                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ,
+                      "verifier.pass == true" ] }
 
     - from: ACKNOWLEDGED
       to: DISPUTED
@@ -47,7 +48,8 @@ pipeline:
     - from: PARTIALLY_PAID
       to: PROMISED
       guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
-                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ] }
+                      "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ,
+                      "verifier.pass == true" ] }
 
     - from: PROMISED
       to: BROKEN_PROMISE
@@ -71,7 +73,7 @@ pipeline:
 
 timers:
   - { on: CONTACTED, at: "entered_at + 3d", do: timer.followup_due, name: followup }
-  - { on: PROMISED,  at: "facts.promise_date - 1d", do: timer.promise_reminder_due, name: reminder }
+  - { on: PROMISED,  at: "facts.promise_date - 1d", do: timer.promise_reminder_due, name: reminder, min_lead: 12h }
   - { on: PROMISED,  at: "facts.promise_date + 2d", do: timer.promise_check_due, name: check }
 
 task_types:
@@ -112,6 +114,7 @@ prompts:
   operator: prompts/operator.md
   conversation: prompts/conversation.md
   mission: prompts/mission.md
+  verifier: prompts/verifier.md
 
 # Reply Classifier slot: the intents this role recognises in counterparty messages.
 reply_classifier:
@@ -126,6 +129,12 @@ reply_classifier:
     not_now: "acknowledges the message without any commitment"
     opt_out: "asks the company to stop contacting them"
     unclear: "none of the above, or cannot tell"
+
+# Verifier settings (deterministic checks always; a second LLM opinion only when needed).
+verification:
+  promise:
+    max_days_ahead: 60
+    second_opinion_below: 0.9      # classifier confidence below this -> Verifier judges the message too
 
 # Matching money records (bank statement lines) to entities.
 reconciliation:
@@ -197,6 +206,8 @@ mission:
       description: "Ask the finance manager to approve offering an instalment plan to this customer."
       states: [ACKNOWLEDGED, BROKEN_PROMISE, NO_RESPONSE]
       needs_approval: true
+      action: payment_plan
+      grants_phrases: [instalment, installment, payment plan]
     check_bank:
       description: "Download a fresh bank statement now and reconcile."
       needs_groups: false

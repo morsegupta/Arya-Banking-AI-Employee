@@ -51,6 +51,7 @@ class TimerSpec(BaseModel):
     at: str                 # "<path> [+|- N(d|h|m)]", e.g. "facts.promise_date - 1d", "entered_at + 3d"
     do: str                 # fired event becomes "<do>" with entity context
     name: str | None = None
+    min_lead: str | None = None   # e.g. "12h": not armed if it would fire sooner than this after entering
 
 
 class PipelineSpec(BaseModel):
@@ -245,6 +246,8 @@ class Pipeline:
             due = self._resolve_at(spec.at, facts, entered)
             if due is None:
                 continue
+            if spec.min_lead and due - entered < _duration(spec.min_lead):
+                continue
             self.scheduler.schedule(self._timer_key(entity, spec), due, spec.do, mission_id=entity.mission_id,
                                     entity_id=entity.id, payload={"state": state})
 
@@ -252,6 +255,11 @@ class Pipeline:
         for spec in self.spec.timers:
             if spec.on == state:
                 self.scheduler.cancel(self._timer_key(entity, spec))
+
+
+def _duration(text: str) -> timedelta:
+    n, unit = int(text[:-1]), text[-1]
+    return {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
 
 
 def _row_entity(row: sqlite3.Row) -> Entity:

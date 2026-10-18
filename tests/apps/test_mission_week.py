@@ -175,3 +175,35 @@ async def _inbox(asgi, address):
     async with httpx.AsyncClient(transport=asgi["hub"], base_url="http://hub",
                                  headers={"Authorization": "Bearer hub-sim-token"}) as c:
         return (await c.get(f"/api/v1/mailboxes/{address}/messages")).json()
+
+
+def test_small_target_completes_only_after_fresh_bank_check(servers, sandbox_var, asgi, world):  # noqa: F811
+    rt = build_runtime(var_dir=sandbox_var, vault=Vault(SANDBOX_SECRETS), llm=ScriptedLLM([llm] * 1000),
+                       hub_transport=asgi["hub"], erp_transport=asgi["erp"])
+    sim = SimEngine(world, "http://hub", "http://bank", hub_transport=asgi["hub"], bank_transport=asgi["bank"])
+    runner = MissionRunner(rt)
+
+    async def run():
+        try:
+            await runner.create("Collect the 45+ day overdue invoices — target ₹3L by Friday.")
+            runner.approve(by="test")
+            for _ in range(3):
+                result = await runner.tick()
+                if result["status"] != "ACTIVE":
+                    return result
+                await sim.tick()
+                result = await runner.tick()
+                if result["status"] != "ACTIVE":
+                    return result
+                clock.advance(timedelta(days=1))
+                await sim.tick()
+        finally:
+            await sim.close()
+            await rt.close()
+
+    result = asyncio.run(run())
+    assert result["status"] == "COMPLETED", "\n".join(runner.log)
+    check = rt.events.query(types=["verification.completed"])[-1].payload
+    assert check["subject"] == "mission" and check["passed"] and check["re_observed"] >= 3_00_000_00
+    done = rt.events.query(mission_id=runner.mission_id, types=["mission.transitioned"])[-1].payload
+    assert done["to"] == "COMPLETED" and done["verified_value"] == check["re_observed"]

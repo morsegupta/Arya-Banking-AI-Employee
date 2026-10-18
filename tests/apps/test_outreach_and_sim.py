@@ -51,9 +51,9 @@ def test_outreach_email_moves_entity_to_contacted(make_runtime, asgi):
     assert out.ok and out.channel == "email" and out.transition.ok and out.transition.entity.state == "CONTACTED"
     inbox = hub_messages(asgi, "ritu.malhotra@globex-retail.example")
     assert inbox[0]["attachments"][0]["filename"] == "INV-2291.pdf"
-    # The agent saw formatted money and the company's bank details, not raw paise.
+    # The agent saw formatted money, and the company's bank details only as a placeholder.
     prompt = llm.seen[0]["messages"][1]["content"]
-    assert "₹3,40,000.00" in prompt and "50200012345678" in prompt
+    assert "₹3,40,000.00" in prompt and "{{pii:account_1}}" in prompt and "50200012345678" not in prompt
     assert [t["key"].split(":")[-1] for t in rt.scheduler.pending()] == ["followup"]
 
 

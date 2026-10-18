@@ -16,8 +16,9 @@ def call(name: str, args: dict[str, Any], cid: str | None = None) -> ToolCall:
 class ScriptedLLM(LLMClient):
     """Each script item is an LLMResponse, a dict (JSON content), or a callable(messages) -> either."""
 
-    def __init__(self, script: list[Any]):
+    def __init__(self, script: list[Any], guard_scores: dict[str, float] | None = None):
         self.script = list(script)
+        self.guard_scores = guard_scores or {}     # substring -> classifier score (default 0.0)
         self.seen: list[dict[str, Any]] = []
         self.calls = []
 
@@ -35,6 +36,9 @@ class ScriptedLLM(LLMClient):
         if budget:
             budget.charge(item.usage.get("total_tokens", 100))
         return item
+
+    async def guard_score(self, text: str, **_) -> float:
+        return max((v for k, v in self.guard_scores.items() if k in text), default=0.0)
 
     async def close(self):
         pass

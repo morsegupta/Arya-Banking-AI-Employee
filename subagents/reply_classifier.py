@@ -20,7 +20,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from collections.abc import Callable
+
 from core.llm import Budget, LLMClient
+from core.pii import Tokenizer, UnknownToken
 
 SYSTEM = """You classify one message a counterparty sent to the company, with respect to the ENTITIES
 the conversation is about (one or several items of the same counterparty).
@@ -115,20 +118,31 @@ def parse_amount(text: str | None, minor_units: int) -> int | None:
 
 
 class ReplyClassifier:
-    def __init__(self, llm: LLMClient, intents: dict[str, str], *, minor_units: int = 100, role_prompt: str = ""):
+    def __init__(self, llm: LLMClient, intents: dict[str, str], *, minor_units: int = 100, role_prompt: str = "",
+                 tokenizer: Callable[[], Tokenizer] | None = None):
         self.llm, self.intents, self.minor_units, self.role_prompt = llm, intents, minor_units, role_prompt
+        self.tokenizer = tokenizer
 
     async def classify(self, message: str, *, entities: list[dict[str, Any]], today: date,
                        budget: Budget | None = None) -> Classified:
         """`entities`: [{"ref": ..., other summary fields}] for every entity the conversation covers."""
-        user = {"INTENTS": self.intents, "ENTITIES": entities, "TODAY": f"{today.isoformat()} ({today:%A})"}
+        tok = self.tokenizer() if self.tokenizer else None
+        shown = tok.tokenize(message) if tok else message
+        user = {"INTENTS": self.intents, "ENTITIES": tok.tokenize_obj(entities) if tok else entities,
+                "TODAY": f"{today.isoformat()} ({today:%A})"}
         messages = [
             {"role": "system", "content": SYSTEM + (f"\n\n{self.role_prompt}" if self.role_prompt else "")},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False, default=str)},
-            {"role": "user", "content": f"<untrusted_data>\n{message[:4000]}\n</untrusted_data>"},
+            {"role": "user", "content": f"<untrusted_data>\n{shown[:4000]}\n</untrusted_data>"},
         ]
         p = await self.llm.structured("light", messages, Proposal, budget=budget, tag="reply_classifier")
-        return self.check(p, message, known_refs=[e["ref"] for e in entities])
+        c = self.check(p, shown, known_refs=[e["ref"] for e in entities])
+        if tok and c.quote:
+            try:
+                c.quote = tok.detokenize(c.quote)
+            except UnknownToken:
+                c.quote, c.problems = None, [*c.problems, "quote contains invented placeholders"]
+        return c
 
     def check(self, p: Proposal, message: str, known_refs: list[str] | None = None) -> Classified:
         problems: list[str] = []

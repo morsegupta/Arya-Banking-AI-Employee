@@ -171,6 +171,8 @@ def test_erp_post_receipt_through_browser(setup, ctx):
 
     async def flow():
         c = ctx(scope)
+        c.write_scope = {"erp_web": [{"method": "POST", "path": "/invoices/INV-2263/receipts",
+                                      "form": {"amount": "88000.00", "reference": "N287261234"}}]}
         obs = (await reg.invoke("erp_web.open", {"path": "/invoices/INV-2263/receipts/new"}, c)).output
         await reg.invoke("erp_web.fill", {"ref": find(obs, "Amount (₹)")["ref"], "value": "88000"}, c)
         obs = (await reg.invoke("erp_web.fill", {"ref": find(obs, "Bank reference / UTR")["ref"],
@@ -189,6 +191,37 @@ def test_erp_post_receipt_through_browser(setup, ctx):
     inv = httpx.get(f"{urls['erp_web']}/api/v1/invoices/INV-2263",
                     headers={"X-API-Key": "erp-sandbox-readonly-key"}).json()
     assert inv["status"] == "PAID" and len(inv["receipts"]) == 1
+
+
+def _receipt_attempt(reg, c, ref, amount, utr):
+    async def go():
+        obs = (await reg.invoke("erp_web.open", {"path": f"/invoices/{ref}/receipts/new"}, c)).output
+        await reg.invoke("erp_web.fill", {"ref": find(obs, "Amount (₹)")["ref"], "value": amount}, c)
+        obs = (await reg.invoke("erp_web.fill", {"ref": find(obs, "Bank reference / UTR")["ref"], "value": utr},
+                                c)).output
+        c.idempotency_key = f"k:{ref}:{amount}:{utr}"
+        return await reg.invoke("erp_web.click", {"ref": find(obs, "Post receipt")["ref"]}, c)
+    return go()
+
+
+def test_erp_writes_limited_to_the_granted_receipt(setup, ctx):
+    reg, sessions, urls = setup
+    c = ctx({"erp_web"})
+    c.write_scope = {"erp_web": [{"method": "POST", "path": "/invoices/INV-2263/receipts",
+                                  "form": {"amount": "88000.00", "reference": "N287261234"}}]}
+
+    async def flow():
+        wrong_amount = await _receipt_attempt(reg, c, "INV-2263", "90000", "N287261234")
+        other_invoice = await _receipt_attempt(reg, c, "INV-2291", "88000", "N287261234")
+        right = await _receipt_attempt(reg, c, "INV-2263", "88000", "N287261234")
+        return wrong_amount, other_invoice, right
+
+    wrong_amount, other_invoice, right = run_session(sessions, flow)
+    assert wrong_amount.error_kind == "denied" and "amount" in wrong_amount.error
+    assert other_invoice.error_kind == "denied" and "not a write this task was granted" in other_invoice.error
+    assert right.ok
+    receipts = httpx.get(f"{urls['erp_web']}/api/v1/receipts", headers={"X-API-Key": "erp-sandbox-readonly-key"}).json()
+    assert [(r["invoice_number"], r["amount_paise"]) for r in receipts] == [("INV-2263", 88000_00)]
 
 
 def test_erp_rest_paths_denied_in_browser(setup, ctx):

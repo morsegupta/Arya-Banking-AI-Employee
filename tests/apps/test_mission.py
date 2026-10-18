@@ -34,7 +34,8 @@ def router(messages):
     payload = json.loads(messages[1]["content"])
     if "TASK: understand" in system:
         return {"objective": "Collect overdue receivables", "scope": "OPEN invoices 45+ days overdue",
-                "target_text": "₹12L", "deadline": "2026-10-23", "selection": {"min_days_overdue": 45},
+                "target_text": re.search(r"₹\d+L", payload["BRIEF"]).group(0), "deadline": "2026-10-23",
+                "selection": {"min_days_overdue": 45},
                 "success_criteria": ["₹12L verified in the bank"], "assumptions": [], "open_questions": []}
     if "TASK: plan" in system:
         # everything on day 0: code must split it by capacity
@@ -45,7 +46,12 @@ def router(messages):
         return {"assessment": "On track.", "actions": []}
     if "Conversation Agent" in system:
         email = payload["CHANNEL"] == "email"
-        return {"subject": "Overdue invoices" if email else None, "body": "Please share a payment date.",
+        body = "Please share a payment date."
+        if "bank details" in payload["PURPOSE"]:
+            body = f"Our bank details have not changed. Please pay only to A/c {payload['COMPANY_FACTS']['bank_account_number']}."
+        if "approved the concession" in payload["PURPOSE"]:
+            body = "Good news: the discount you asked for is approved. Please confirm the payment date."
+        return {"subject": "Overdue invoices" if email else None, "body": body,
                 "attachments": payload["AVAILABLE_DOCUMENTS"], "facts_used": []}
     if "You classify one message" in system:
         text = _untrusted(messages)
@@ -157,7 +163,8 @@ def test_review_levers_are_executed_by_code(make_runtime, asgi):
         assert len(globex) == 1 and globex[0]["channel"] == "whatsapp"
         # approval levers never act: they only ask
         assert asyncio.run(r.execute("propose_payment_plan", ["C01"], "test")) == "approval requested"
-        asked = rt.events.query(mission_id=r.mission_id, types=["approval.requested"])
-        assert [(e.payload["lever"], e.payload["group"]) for e in asked] == [("propose_payment_plan", "C01")]
+        asked = rt.approvals.list(mission_id=r.mission_id, status="PENDING")
+        assert [(a.payload["action"], a.payload["group"]) for a in asked] == [("payment_plan", "C01")]
+        assert rt.approvals.list(mission_id=r.mission_id, status="APPROVED")[0].payload["action"] == "mission_plan"
     finally:
         asyncio.run(rt.close())

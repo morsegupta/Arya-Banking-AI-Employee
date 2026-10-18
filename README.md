@@ -9,9 +9,11 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 2 morning complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 2 midday complete.** A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
-covering all their overdue invoices). Day 1's single-invoice flow still runs end to end.
+covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
+that commits the company waits in an approvals inbox; text that tries to instruct the AI is
+quarantined before any agent reads it; and models never see account numbers, emails or phone numbers.
 
 | Block | Delivered |
 |---|---|
@@ -20,8 +22,34 @@ covering all their overdue invoices). Day 1's single-invoice flow still runs end
 | Day 1 afternoon | LLM client, pipeline + guards, Operator and Conversation agents, customer simulator + payment engine |
 | Day 1 evening | Reply Classifier, Matcher, settlement (receipt + Verifier), orchestrator, end-to-end demo |
 | Day 2 morning | Mission Agent (brief → spec → plan → daily review), mission state machine, Prioritizer, Matcher for one-payment-many-invoices and partials, multi-invoice Reply Classifier, Document Generator (statement of account) |
+| Day 2 midday | Verifier Agent + Evidence Collector, Policy Gate + `policies.yaml`, Approval Broker + `approvals` CLI, Injection Guard (Prompt Guard 2 + patterns, quarantine path), PII tokenization, fraud and concession handling |
 
-Next: Day 2 midday — Verifier agent, Policy Gate, Approval Broker, injection guard.
+Next: Day 2 afternoon — reliability (fallbacks, replan, loop detection, budgets, resume after kill, chaos).
+
+## Trust layer (Day 2 midday)
+
+| Control | What it does | Where |
+|---|---|---|
+| Policy Gate | Every tool call: allowed actions per app, forbidden wording (threats) → refused; quiet hours 20:00–09:30 and weekends → deferred; max 3 contacts per person per week → deferred; concessions (discount, payment plan…) or quarantined accounts → held for a human | [core/policy.py](core/policy.py), [policies.yaml](packs/companies/sharma_distributors/policies.yaml) |
+| Scoped writes | An ERP write is possible only inside a task granted that exact change. Receipt tasks may submit one receipt, for the matched invoice, amount and bank reference; anything else is blocked at the browser's network layer, and the gate refuses ERP writes in tasks without a grant | [tools/browser.py](tools/browser.py), [apps/settlement.py](apps/settlement.py) |
+| Approval Broker | Holds the exact action; approving it runs that action verbatim (same text, same idempotency key); only a named human can decide | [core/approvals.py](core/approvals.py), [apps/approvals.py](apps/approvals.py) |
+| Injection Guard | Inbound messages with their PDF/text attachments, the policy documents the Mission Agent reads, and every untrusted Operator observation are scored (Prompt Guard 2 86M, chunked, cached by hash) plus pattern checks. Flagged text is replaced by a redacted note, the account or task is quarantined, and a human reviews it | [core/injection.py](core/injection.py) |
+| PII tokenization | Account numbers, IFSC, emails and phones reach models (Conversation, Reply Classifier, Verifier, Mission and the Operator's page and file observations) only as `{{pii:account_1}}`; code fills real values in, including in the Operator's tool arguments. A draft that writes a raw account number or an unknown token is rejected, so a model cannot alter bank details | [core/pii.py](core/pii.py) |
+| Verifier Agent | Deterministic checks first; a second, independent LLM opinion only for borderline promises (classifier confidence < 0.9). `PROMISED` now needs the Verifier too. Before `COMPLETED`, the bank is re-read in a fresh session and only lines really there count | [agents/verifier_agent.py](agents/verifier_agent.py) |
+| Evidence Collector | Messages, statements, bank lines, receipts and verification results stored per invoice, files with SHA-256 | [subagents/evidence.py](subagents/evidence.py) |
+| Fraud | "Our bank details changed" → never acted on: escalated, and the official details are restated | orchestrator |
+
+```bash
+uv run python -m apps.cli approvals
+```
+
+```bash
+uv run python -m apps.cli approvals show apr_...
+```
+
+```bash
+uv run python -m apps.cli approvals approve apr_... --by "Priya (Finance Manager)" --note "5% ok"
+```
 
 ## Run a mission from a brief
 
@@ -96,14 +124,14 @@ uv run python -m apps.cli demo INV-2297 --sim-llm
 Expected output (abridged):
 
 ```
-== Mon 19 Oct 2026 09:00: start INV-2297
+== Mon 19 Oct 2026 10:00: start INV-2297
   outreach INV-2297: email: delivered
   INV-2297: OVERDUE -> CONTACTED ok
   [world] C11 replied (promise)
   INV-2297: reply classified promise_to_pay (0.97), amount 5400000, date 2026-10-20
   INV-2297: CONTACTED -> PROMISED ok
   bank sync: no new matching payments
-== Tue 20 Oct 2026 09:00
+== Tue 20 Oct 2026 10:00
   [world] C11 paid ₹54,000.00 UTR N497403142
   INV-2297: matched N497403142 (reference) receipt RCPT-0001; verifier pass; PROMISED -> PAID ok
 ```
@@ -146,7 +174,13 @@ The sandbox clock is simulated: days pass in seconds. Every step is an event in 
 - **No invented data.** Operator results must cite real tool calls; messages may only state provided
   facts; classifier quotes must appear verbatim in the reply.
 - **Look-alike payments don't count.** "SUNRISE TRADING CO" never matches *Sunrise Hardware*.
-- **Untrusted content stays data.** Pages, PDFs and messages are wrapped as `<untrusted_data>`.
+- **Untrusted content stays data.** Pages, PDFs and messages are wrapped as `<untrusted_data>`, and
+  screened first: text that tries to instruct the AI is quarantined and never shown to an agent.
+- **Policy before every action.** Threats are refused, quiet hours and contact caps defer, concessions
+  wait for a named human, and an approved action runs exactly as approved.
+- **Models never see account numbers or contact details.** They write placeholders; code fills them in.
+- **A task can only make the change it was created for.** A receipt task can post one receipt: the
+  matched invoice, amount and bank reference, enforced on the wire.
 - **One writer at a time.** A run lock stops a demo and a re-seed from corrupting each other.
 
 ## Repository layout
@@ -178,7 +212,8 @@ collections domain: all domain knowledge lives in packs.
 | Shared drive | `var/drive/` | Invoice PDFs, signed delivery notes, supply agreements, credit policy. |
 
 Everything is seeded from [evals/worlds/sharma_default.yaml](evals/worlds/sharma_default.yaml):
-15 customers, 25 invoices, 10 prior bank transactions, sandbox date Monday 2026-10-19.
+15 customers, 25 invoices, 10 prior bank transactions, sandbox time Monday 2026-10-19 10:00 IST
+(after contact hours open at 09:30).
 Each customer has a hidden persona (prompt payer, late payer, partial payer, disputer, "already paid"
 true or false, discount haggler, ghost, prompt-injection attacker, bank-detail fraudster). Personas
 are ground truth for the simulator and evals and are never written into any system the agent can read.
@@ -195,10 +230,10 @@ All served by Groq's OpenAI-compatible API; change any role in [config/models.ya
 |---|---|
 | Operator, Conversation | `openai/gpt-oss-120b` (reasoning: medium) |
 | Mission | `openai/gpt-oss-120b` (reasoning: high) |
-| Verifier (Day 2 midday) | `openai/gpt-oss-120b` (reasoning: high) |
+| Verifier (second opinion on borderline promises) | `openai/gpt-oss-120b` (reasoning: high) |
 | Reply Classifier, light sub-agents | `qwen/qwen3.8-27b` |
 | Customer simulator | `qwen/qwen3.8-27b` (a different family from the agents, so evals stay honest) |
-| Injection guard (Day 2) | `meta-llama/llama-prompt-guard-2-86m` |
+| Injection guard | `meta-llama/llama-prompt-guard-2-86m` |
 
 The LLM client throttles from Groq's rate-limit headers, retries 429/5xx, re-samples malformed
 gpt-oss output, enforces token budgets and prints when it is waiting.
@@ -218,6 +253,7 @@ uv run python -m apps.cli mission new "<brief>"                  # Mission Agent
 uv run python -m apps.cli mission show|board|plan|approve|tick   # inspect, (re)plan, approve, one tick
 uv run python -m apps.cli mission answer "<text>"                # answer the agent's blocking questions
 uv run python -m apps.cli mission run [--days 5] [--sim-llm]     # tick daily with simulated customers
+uv run python -m apps.cli approvals [list|show|approve|reject]   # the human decisions inbox
 uv run python -m sandbox.customer_sim tick [--llm]               # simulated customers act
 uv run python -m sandbox.customer_sim advance 1d                 # move simulated time
 ```
@@ -228,7 +264,7 @@ uv run python -m sandbox.customer_sim advance 1d                 # move simulate
 make test
 ```
 
-235 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+260 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -243,9 +279,10 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 2+).** Policy Gate (quiet hours, contact caps) and the Approval Broker (payment-plan
-  requests are recorded as `approval.requested` events for now), injection guard screening,
-  chaos/recovery scenarios, workspace UI, eval harness.
+- **Not built yet (Day 2 afternoon+).** Chaos/recovery scenarios, workspace UI, eval harness, memory.
+- If the injection classifier is unreachable, inbound messages are quarantined (fail closed) and page
+  observations fall back to pattern checks only.
+- Attachments that are not text (images, scans) cannot be screened; no agent reads them either.
 - The forecast uses fixed per-state probabilities from the role pack until memory supplies real history.
 - A new promise from a customer who is already `PROMISED` (e.g. a later date after a reminder) is
   classified and logged but does not yet replace the old promise date (Day 2 afternoon: replan).

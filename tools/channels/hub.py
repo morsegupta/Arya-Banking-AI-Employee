@@ -144,6 +144,8 @@ class SendTool(_ChannelTool):
     risk = "external_comm"
     idempotent = False
     dedupes_downstream = True
+    target_field = "to"
+    content_fields = ("subject", "body")
     input_schema = SendArgs
 
     def __init__(self, *a):
@@ -229,6 +231,8 @@ class CallRequestTool(Tool):
     risk = "external_comm"
     kind = "channel"
     idempotent = False
+    target_field = "to"
+    content_fields = ("purpose",)
     description = "Ask for a phone call with a contact. Returns a call id; check its status later."
     input_schema = CallRequestArgs
 

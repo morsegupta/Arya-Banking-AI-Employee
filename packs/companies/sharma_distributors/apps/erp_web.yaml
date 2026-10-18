@@ -10,6 +10,7 @@ login:
   submit: Log in
 logout_path: /logout
 deny_paths: [/api/]                  # use the REST connector for reads, not the browser
+scoped_writes: true                  # a task may only submit the exact receipt it was created for
 notes:
   - Each invoice page has a "Record receipt" link while the invoice is open.
   - The receipt form needs date, amount, payment mode and bank reference / UTR.
