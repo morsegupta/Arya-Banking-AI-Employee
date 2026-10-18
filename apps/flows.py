@@ -16,7 +16,7 @@ from agents.conversation_agent import ConversationAgent, DraftRejected
 from agents.operator_agent import OperatorAgent
 from apps.runtime import Runtime
 from core.llm import Budget, LLMError
-from core.models import Entity, Evidence, FailureReport, Task, TaskResult
+from core.models import ConversationTurn, Entity, Evidence, FailureReport, Task, TaskResult
 from core.pipeline import TransitionResult
 from tools.app_map import load_app_maps
 from tools.base import RunContext
@@ -129,6 +129,7 @@ class OutreachOutcome:
     transitions: list[TransitionResult] = field(default_factory=list)
     held: str | None = None              # approval id: a human must approve this exact message first
     deferred_until: str | None = None    # policy: not now (quiet hours, contact cap); try again later
+    draft: dict[str, Any] | None = None  # draft_only: the message that would be sent
 
 
 def group_facts(rt: Runtime, loaded: list[LoadedEntity]) -> dict[str, Any]:
@@ -152,9 +153,15 @@ def group_key(entities: list[Entity]) -> str:
 async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], *, step: str = "outreach1",
                    purpose: str | None = None, transition_to: str | None = "CONTACTED",
                    extra_facts: dict[str, Any] | None = None, extra_documents: list[str] | None = None,
-                   channels: list[str] | None = None) -> OutreachOutcome:
+                   channels: list[str] | None = None, draft_only: bool = False,
+                   prepared: dict[str, Any] | None = None, examples: list[str] | None = None) -> OutreachOutcome:
     """Draft and send one message about one entity, or several entities of the same counterparty,
-    falling back across channels; optionally move every entity it covers."""
+    falling back across channels; optionally move every entity it covers.
+
+    draft_only: draft for the first reachable channel and return it without sending (for approval).
+    prepared:   a message a human approved: sent verbatim on its channel, no re-drafting. If that
+                channel fails, the next channel gets a fresh draft (and the Policy Gate as usual).
+    examples:   approved messages the draft should match in tone and structure."""
     cfg = role_cfg(rt)["outreach"]
     refs = [external_ref] if isinstance(external_ref, str) else list(external_ref)
     loaded = [await load_entity(rt, mission_id, ref) for ref in refs]
@@ -175,15 +182,24 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
         if not to:
             attempts.append(f"{channel}: no address")
             continue
+        approved = prepared if prepared and prepared.get("channel") == channel and prepared.get("to") == to else None
         for _ in range(2):                    # a draft refused for its wording is rewritten once
-            try:
-                turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"],
-                                         entity_facts=facts, company_facts=cfacts, documents=documents,
-                                         budget=budget, avoid=avoid)
-            except (DraftRejected, LLMError) as exc:
-                attempts.append(f"{channel}: draft rejected: {exc}")
-                turn = None
-                break
+            if approved:
+                turn = ConversationTurn(channel=channel, to=to, subject=approved.get("subject"),
+                                        body=approved["body"], attachments=approved.get("attachments", []))
+            else:
+                try:
+                    turn = await agent.draft(channel=channel, to=to, purpose=purpose or cfg["purpose"],
+                                             entity_facts=facts, company_facts=cfacts, documents=documents,
+                                             budget=budget, avoid=avoid, examples=examples)
+                except (DraftRejected, LLMError) as exc:
+                    attempts.append(f"{channel}: draft rejected: {exc}")
+                    turn = None
+                    break
+            if draft_only:
+                return OutreachOutcome(True, channel, None, None, attempts, draft={
+                    "channel": channel, "to": turn.to, "subject": turn.subject, "body": turn.body,
+                    "attachments": turn.attachments, "refs": refs})
             ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id,
                              allowed_apps={channel}, idempotency_key=f"{mission_id}:{key}:{step}:{channel}",
                              artifacts_dir=rt.artifacts_dir)
@@ -192,7 +208,8 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
                 args["subject"] = turn.subject
             res = await rt.registry.invoke(f"{channel}.send", args, ctx)
             policy = (res.output or {}).get("policy") if not res.ok and isinstance(res.output, dict) else None
-            if policy and policy["policy_action"] == "deny" and policy["rule"].endswith("deny_phrases") and not avoid:
+            if policy and policy["policy_action"] == "deny" and policy["rule"].endswith("deny_phrases") \
+                    and not avoid and not approved:
                 avoid = list(rt.policies.get("external_comm", {}).get("deny_phrases", []))
                 attempts.append(f"{channel}: wording refused by policy, redrafting")
                 continue
@@ -211,7 +228,7 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
             if res.error_kind in {"permanent", "transient"}:
                 continue                     # L2 fallback: bounced, or still failing after L0 retries -> next channel
             break
-        attempts.append(f"{channel}: delivered {res.output['id']}")
+        attempts.append(f"{channel}: delivered {res.output['id']}" + (" (approved wording)" if approved else ""))
         sent = {"channel": channel, "message_id": res.output["id"], "thread_id": res.output["thread_id"]}
         transitions = apply_sent(rt, entities, sent, transition_to=transition_to, step=step)
         return OutreachOutcome(True, channel, res.output, transitions[0] if transitions else None, attempts,

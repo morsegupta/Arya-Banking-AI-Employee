@@ -13,6 +13,7 @@ tools:
       writes_need_scope: true
 
 external_comm:
+  first_batch_requires_approval: true   # day-0 messages are drafted with the plan; a human approves the exact text
   quiet_hours: "20:00-09:30"
   weekdays_only: true
   max_per_target: { count: 3, days: 7 }     # per email address / phone number

@@ -360,6 +360,11 @@ async def cmd_approvals(args) -> None:
                 print(f"  held: {p['tool']} because {p['reason']}")
                 for k, v in p["args"].items():
                     print(f"    {k}: {str(v)[:600]}")
+            for gid, d in (p.get("messages") or {}).items():
+                print(f"  ┌ {gid} {d['channel']} to {d['to']}: {d.get('subject') or ''}")
+                for line in d["body"].splitlines():
+                    print(f"  │ {line}")
+                print(f"  └ attachments: {', '.join(d.get('attachments', []))}")
             if p.get("screening"):
                 print(f"  screening: {p['screening']}")
                 print("  (message withheld from the agents; read it in the message hub)")

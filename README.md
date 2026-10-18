@@ -97,7 +97,14 @@ Arya reads the brief and the credit policy, picks the invoices, ranks customers 
   day 1: Day1 Soft Batch [soft_reminder] C12 Nilgiri Wholesale (1), C05 Sunrise Hardware (1), ...
 ```
 
-Nothing is sent until a human approves. Then tick once per (simulated) day:
+Nothing is sent until a human approves. With the plan, Arya drafts the **actual day-0 messages**
+(policy `first_batch_requires_approval`): `mission show` and `approvals show` print them, approving the
+plan approves that exact wording, and those messages go out verbatim, never re-drafted. Rejecting with
+a note (`mission reject "too formal"`) produces a new plan and new drafts that take the note into
+account. Later batches use the approved messages as style examples. A day-0 customer whose draft
+failed or whose invoices changed after approval is not contacted until a new plan is approved.
+
+Then tick once per (simulated) day:
 
 ```bash
 uv run python -m apps.cli mission approve
@@ -296,7 +303,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-271 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+273 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole

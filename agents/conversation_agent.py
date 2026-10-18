@@ -40,7 +40,9 @@ Rules:
 - In facts_used, list the keys of the facts your message states.
 - Values like {{pii:account_1}} are placeholders for real data: copy them exactly where the value
   belongs; never write such values out yourself.
-- Never use any word or phrase listed in AVOID."""
+- Never use any word or phrase listed in AVOID.
+- APPROVED_EXAMPLES, when given, are messages a manager approved for other customers: match their
+  tone, length and structure, but take every fact from ENTITY_FACTS and COMPANY_FACTS, never from them."""
 
 
 class Draft(BaseModel):
@@ -63,7 +65,7 @@ class ConversationAgent:
                     entity_facts: dict[str, Any], company_facts: dict[str, Any],
                     history: list[dict[str, Any]] | None = None, documents: list[str] | None = None,
                     in_reply_to: str | None = None, budget: Budget | None = None,
-                    avoid: list[str] | None = None) -> ConversationTurn:
+                    avoid: list[str] | None = None, examples: list[str] | None = None) -> ConversationTurn:
         documents = documents or []
         tok = self.tokenizer() if self.tokenizer else None
         shown_entity = tok.tokenize_obj(entity_facts) if tok else entity_facts
@@ -73,6 +75,8 @@ class ConversationAgent:
             "ENTITY_FACTS": shown_entity, "COMPANY_FACTS": shown_company, "AVAILABLE_DOCUMENTS": documents,
             "AVOID": avoid or [],
         }
+        if examples:
+            prompt["APPROVED_EXAMPLES"] = [tok.tokenize(e) if tok else e for e in examples[:3]]
         messages = [
             {"role": "system", "content": SYSTEM + (f"\n\nRole guidance:\n{self.role_prompt}" if self.role_prompt else "")},
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str)},

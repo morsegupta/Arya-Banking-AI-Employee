@@ -168,3 +168,65 @@ def test_review_levers_are_executed_by_code(make_runtime, asgi):
         assert rt.approvals.list(mission_id=r.mission_id, status="APPROVED")[0].payload["action"] == "mission_plan"
     finally:
         asyncio.run(rt.close())
+
+
+def numbered_router():
+    """Router whose drafts are numbered, so we can tell which draft was sent."""
+    seen = {"n": 0, "purposes": []}
+
+    def llm(messages):
+        if "Conversation Agent" in messages[0]["content"]:
+            seen["n"] += 1
+            seen["purposes"].append(json.loads(messages[1]["content"])["PURPOSE"])
+            d = router(messages)
+            return {**d, "body": f"{d['body']} [draft {seen['n']}]"}
+        return router(messages)
+    return llm, seen
+
+
+def test_first_batch_wording_is_approved_and_sent_verbatim(make_runtime, asgi):
+    llm, seen = numbered_router()
+    rt = make_runtime(ScriptedLLM([llm] * 200))
+    r = MissionRunner(rt)
+    try:
+        m = asyncio.run(r.create(BRIEF))
+        first = m.data["first_batch"]
+        assert len(first) == 6 and seen["n"] == 6, "day-0 messages drafted with the plan, nothing sent"
+        assert hub_inbox(asgi, "arjun.rao@initech-supplies.example") == []
+        approval = rt.approvals.list(status="PENDING")[0]
+        assert approval.payload["messages"] == first
+        assert any("first-batch messages" in line for line in plan_text(m))
+
+        # a reject with a note gives a new plan and new drafts that carry the note
+        asyncio.run(r.reject("Too formal. Mention the statement is attached."))
+        assert "Too formal" in seen["purposes"][-1] and r.mission.status == "AWAITING_PLAN_APPROVAL"
+        first = r.mission.data["first_batch"]
+
+        r.approve(by="fm")
+        r.orch._set_kv("last_sync", rt.clock.now().date().isoformat())
+        drafted_before = seen["n"]
+        asyncio.run(r.tick())
+        assert seen["n"] == drafted_before, "approved messages are sent as they are, never re-drafted"
+        sent = hub_inbox(asgi, first["C02"]["to"])[0]
+        assert sent["body"] == first["C02"]["body"] and sent["subject"] == first["C02"]["subject"]
+    finally:
+        asyncio.run(rt.close())
+
+
+def test_day0_group_without_approved_wording_is_not_sent(make_runtime, asgi):
+    rt = make_runtime(ScriptedLLM([router] * 200))
+    r = MissionRunner(rt)
+    try:
+        asyncio.run(r.create(BRIEF))
+        first = dict(r.mission.data["first_batch"])
+        first.pop("C02")
+        rt_store = r.store
+        rt_store.update(r.mission_id, data={"first_batch": first})
+        r.approve(by="fm")
+        r.orch._set_kv("last_sync", rt.clock.now().date().isoformat())
+        asyncio.run(r.tick())
+        assert hub_inbox(asgi, "arjun.rao@initech-supplies.example") == []
+        assert "C02" not in r.mission.data["contacted_groups"]
+        assert any("C02" in line and "awaiting approved wording" in line for line in r.log)
+    finally:
+        asyncio.run(rt.close())

@@ -205,14 +205,19 @@ class MissionRunner:
             "groups": {g.id: {"name": g.name, "refs": [i.ref for i in g.items], "score": round(g.score, 3),
                               "suggested_approach": g.approach} for g in groups},
             "scope_value": total}, event="mission.planned", payload=plan.model_dump(mode="json"))
+        first = await self.draft_first_batch(plan) if self.first_batch_needs_approval() else {}
+        if first:
+            self.store.update(m.id, plan=plan)               # draft problems are recorded on the plan
         self.store.transition(m.id, S.AWAITING_PLAN_APPROVAL, actor="agent", reason="plan ready")
         version = self.store.get(m.id).data.get("plan_version", 0) + 1
-        self.store.update(m.id, data={"plan_version": version})
-        self.rt.approvals.request(key=f"plan:{m.id}:{version}", kind="decision", mission_id=m.id,
-                                  title=f"Approve the plan for: {m.brief}",
-                                  payload={"action": "mission_plan", "summary": plan.summary,
-                                           "batches": [b.model_dump() for b in plan.batches],
-                                           "question": "Approve = start contacting customers as planned."})
+        self.store.update(m.id, data={"plan_version": version, "first_batch": first})
+        self.rt.approvals.request(
+            key=f"plan:{m.id}:{version}", kind="decision", mission_id=m.id, title=f"Approve the plan for: {m.brief}",
+            payload={"action": "mission_plan", "summary": plan.summary,
+                     "batches": [b.model_dump() for b in plan.batches], "messages": first,
+                     "question": "Approve = start contacting customers as planned"
+                                 + (", sending the first-batch messages exactly as shown." if first else ".")
+                                 + " Reject with a note to get a new plan and new drafts."})
         self._say(f"plan ready ({len(plan.batches)} batches); waiting for approval"
                   + (f" | code corrected: {plan.problems}" if plan.problems else ""))
         return self.mission
@@ -220,6 +225,42 @@ class MissionRunner:
     def _plan_approval(self):
         version = self.mission.data.get("plan_version")
         return self.rt.approvals.by_key(f"plan:{self.mission_id}:{version}") if version else None
+
+    # --- first batch: exact wording approved with the plan -----------------------------------------------
+
+    def first_batch_needs_approval(self) -> bool:
+        return bool(self.rt.policies.get("external_comm", {}).get("first_batch_requires_approval"))
+
+    async def draft_first_batch(self, plan: MissionPlan) -> dict[str, dict[str, Any]]:
+        """Draft the real day-0 messages (no sending) so the manager approves their exact wording."""
+        drafts: dict[str, dict[str, Any]] = {}
+        feedback = self.mission.data.get("message_feedback", [])
+        for batch in [b for b in plan.batches if b.start_day == 0]:
+            spec = self.mcfg["approaches"][batch.approach]
+            for gid in batch.groups:
+                ents = self._open_initial(gid)
+                if not ents:
+                    continue
+                extra = []
+                if "statement_of_account" in spec.get("documents", []):
+                    from apps.documents import generate
+                    extra.append(await generate(self.rt, self.mission_id, "statement_of_account", group=gid))
+                purpose = spec["purpose"] + (" Manager feedback on earlier drafts: " + " | ".join(feedback)
+                                             if feedback else "")
+                out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents], purpose=purpose,
+                                     extra_documents=extra, draft_only=True)
+                if out.draft:
+                    drafts[gid] = {**out.draft, "approach": batch.approach}
+                else:
+                    plan.problems.append(f"could not draft the first message for {gid}: {out.attempts}; "
+                                         "it will not be sent until a new plan is approved")
+        self._say(f"drafted {len(drafts)} first-batch message(s) for approval")
+        return drafts
+
+    def _open_initial(self, gid: str) -> list[Entity]:
+        ents = [e for e in self.rt.pipeline.list(self.mission_id)
+                if self._group_of(e) == gid and e.state in self.rt.pipeline.spec.initial]
+        return self.orch._oldest_first(ents)
 
     def approve(self, *, by: str = "finance_manager") -> Mission:
         a = self._plan_approval()
@@ -235,7 +276,9 @@ class MissionRunner:
         if a and a.status == "PENDING":
             self.rt.approvals.decide(a.id, approve=False, by=by, note=reason)
         m = self.store.transition(self.mission_id, S.DRAFT, actor="human", reason=reason)
-        self.store.update(m.id, data={"answers": [*m.data.get("answers", []), f"Plan rejected: {reason}"]})
+        self.store.update(m.id, data={"answers": [*m.data.get("answers", []), f"Plan rejected: {reason}"],
+                                      "message_feedback": [*m.data.get("message_feedback", []), reason],
+                                      "first_batch": {}})
         return await self.plan()
 
     # --- progress -----------------------------------------------------------------------------------
@@ -340,6 +383,10 @@ class MissionRunner:
         self._say(f"mission resumed by {by}")
         return m
 
+    def _is_day0_group(self, gid: str) -> bool:
+        plan = self.mission.plan
+        return bool(plan) and any(gid in b.groups for b in plan.batches if b.start_day == 0)
+
     def _worth_review(self) -> bool:
         """The agent reviews at most once a day, and only once there is something to review: a reply,
         a payment, a timer outcome, or a day without news."""
@@ -363,8 +410,8 @@ class MissionRunner:
                 if gid in done:
                     continue
                 result = await self.contact_group(gid, batch.approach)
-                if result == "deferred":
-                    continue                    # policy: not now (quiet hours, contact cap); next tick retries
+                if result in {"deferred", "awaiting approved wording"}:
+                    continue                    # not now (quiet hours, cap, unapproved wording); retried later
                 done.add(gid)
                 self.store.update(m.id, data={"contacted_groups": sorted(done)})
                 sent.append(f"{gid}:{result}")
@@ -372,17 +419,29 @@ class MissionRunner:
 
     async def contact_group(self, gid: str, approach: str, *, step: str = "outreach1") -> str:
         spec = self.mcfg["approaches"][approach]
-        ents = [e for e in self.rt.pipeline.list(self.mission_id)
-                if self._group_of(e) == gid and e.state in self.rt.pipeline.spec.initial]
+        ents = self._open_initial(gid)
         if not ents:
             return "nothing open"
-        ents = self.orch._oldest_first(ents)
+        refs = [e.external_ref for e in ents]
+        first = self.mission.data.get("first_batch", {})
+        prepared = first.get(gid)                         # first contact: always the approved text if there is one
+        if prepared and prepared.get("refs") != refs:
+            self._say(f"{gid}: invoices changed since the drafts were approved ({prepared.get('refs')} -> {refs}); "
+                      "not sending the approved text")
+            prepared = None
+        if not prepared and self._is_day0_group(gid) and self.first_batch_needs_approval():
+            self._say(f"{gid}: no approved wording for this first-batch message; not sent (awaiting approved wording)")
+            return "awaiting approved wording"           # policy: first-batch wording must be approved
         extra = []
-        if "statement_of_account" in spec.get("documents", []):
+        if prepared:
+            extra = [a for a in prepared.get("attachments", []) if a not in {d for e in ents
+                                                                            for d in e.data.get("documents", [])}]
+        elif "statement_of_account" in spec.get("documents", []):
             from apps.documents import generate
             extra.append(await generate(self.rt, self.mission_id, "statement_of_account", group=gid))
-        out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents], purpose=spec["purpose"],
-                             extra_documents=extra, step=step)
+        examples = [d["body"] for d in first.values()][:2] if not prepared else None
+        out = await outreach(self.rt, self.mission_id, refs, purpose=spec["purpose"], extra_documents=extra, step=step,
+                             prepared=prepared, examples=examples)
         refs = ",".join(e.external_ref for e in ents)
         self._say(f"{gid} [{approach}] {refs}: " + "; ".join(out.attempts)
                   + (f" -> {sum(t.ok for t in out.transitions)}/{len(ents)} CONTACTED" if out.ok else ""))
@@ -518,6 +577,15 @@ def plan_text(m: Mission, fmt=str) -> list[str]:
             lines.append(f"  day {b.start_day}: {b.name} [{b.approach}] {names}")
             if b.rationale:
                 lines.append(f"         why: {b.rationale}")
+        first = m.data.get("first_batch") or {}
+        if first:
+            lines.append("  first-batch messages (sent exactly as approved):")
+            for gid, d in first.items():
+                lines.append(f"  ┌ {gid} [{d['approach']}] {d['channel']} to {d['to']}: {d.get('subject') or ''}")
+                lines += [f"  │ {line}" for line in d["body"].splitlines()]
+                if d.get("attachments"):
+                    lines.append(f"  │ attachments: {', '.join(d['attachments'])}")
+                lines.append("  └")
         lines += [f"  risk: {r}" for r in p.risks]
         lines += [f"  needs a human: {h}" for h in p.human_asks]
         lines += [f"  (code corrected the plan: {x})" for x in p.problems]
