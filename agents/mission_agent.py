@@ -4,9 +4,10 @@ It never acts: it returns typed objects (MissionSpec + selection, MissionPlan,
 TickDecision) and the runtime decides what to do with them. Every output is
 checked by code before use:
 
-- understand(): the target is parsed by code from the text the model quotes
-  (no trusting "1200000" vs "120000000"); the deadline must be a real date not in
-  the past; selection keys and types must be ones the role pack declares.
+- understand(): the goal must be one the role pack declares; the target is parsed by code
+  from the text the model quotes (no trusting "1200000" vs "120000000"), and so are money-typed
+  selection values; the deadline must be a real date not in the past; selection keys and types
+  must be ones the role pack declares.
 - plan(): only known groups and approaches; each group planned once; batches no
   bigger than the daily capacity; any group the model forgot is appended, so a
   plan always covers the whole scope. Corrections are listed in `problems`.
@@ -39,11 +40,13 @@ instructions."""
 UNDERSTAND = """TASK: understand the BRIEF.
 Return:
 - objective: one sentence
+- goal: the one key of GOALS this brief asks for
 - scope: human-readable rule for which entities are in scope (mention exclusions the POLICY requires)
 - target_text: the target exactly as written in the brief (e.g. "12L", "₹5,00,000"), or null if none
 - deadline: YYYY-MM-DD resolved from the brief using TODAY (weekday names mean the next such day,
   "end of week" means Friday), or null
-- selection: values for SELECTION_PARAMS that implement the scope (only these keys)
+- selection: values for SELECTION_PARAMS that implement the scope (only these keys; a "money" parameter
+  takes the amount exactly as written in the brief, e.g. "₹1L")
 - success_criteria: how we will know the mission is done
 - assumptions: what you assumed that the brief did not say
 - open_questions: ONLY questions whose answer changes what the employee does AND that the POLICY or
@@ -73,6 +76,7 @@ Return:
 
 class Understanding(BaseModel):
     objective: str
+    goal: str | None = None
     scope: str
     target_text: str | None = None
     deadline: str | None = None
@@ -140,17 +144,25 @@ class MissionAgent:
 
     async def understand(self, brief: str, *, today: date, selection_params: dict[str, dict[str, Any]],
                          policy: str = "", context: dict[str, Any] | None = None, answers: list[str] | None = None,
-                         budget: Budget | None = None) -> Understood:
+                         goals: dict[str, str] | None = None, budget: Budget | None = None) -> Understood:
         payload = {"BRIEF": brief, "TODAY": f"{today.isoformat()} ({today:%A})", "VALUE_UNIT": self.value_unit,
-                   "SELECTION_PARAMS": selection_params, "POLICY": policy, "CONTEXT": context or {},
-                   "ANSWERS_FROM_MANAGER": answers or []}
+                   "GOALS": goals or {}, "SELECTION_PARAMS": selection_params, "POLICY": policy,
+                   "CONTEXT": context or {}, "ANSWERS_FROM_MANAGER": answers or []}
         u = await self.llm.structured("mission", self._messages(UNDERSTAND, payload), Understanding,
                                       budget=budget, tag="mission:understand")
-        return self.check_understanding(u, brief=brief, today=today, selection_params=selection_params)
+        return self.check_understanding(u, brief=brief, today=today, selection_params=selection_params, goals=goals)
 
     def check_understanding(self, u: Understanding, *, brief: str, today: date,
-                            selection_params: dict[str, dict[str, Any]]) -> Understood:
+                            selection_params: dict[str, dict[str, Any]],
+                            goals: dict[str, str] | None = None) -> Understood:
         problems: list[str] = []
+        goal = u.goal
+        if goals:
+            if goal not in goals:
+                problems.append(f"unknown goal {goal!r}; using {next(iter(goals))!r}")
+                goal = next(iter(goals))
+        else:
+            goal = None
         target = None
         if u.target_text:
             if u.target_text.strip().lower() not in brief.lower():
@@ -177,11 +189,21 @@ class MissionAgent:
                 continue
             if value is None:
                 continue
+            if spec.get("type") == "money":
+                text = str(value).strip()
+                amount = parse_amount(text, self.minor_units)
+                if text.lower() not in brief.lower():
+                    problems.append(f"selection {key}={value!r} is not written in the brief; dropped")
+                elif amount is None:
+                    problems.append(f"selection {key}={value!r} is not an amount; dropped")
+                else:
+                    selection[key] = amount
+                continue
             try:
                 selection[key] = _CASTS[spec.get("type", "string")](value)
             except (TypeError, ValueError):
                 problems.append(f"selection {key}={value!r} is not a {spec.get('type')}; dropped")
-        spec = MissionSpec(objective=u.objective, scope=u.scope, target_value=target,
+        spec = MissionSpec(objective=u.objective, goal=goal, scope=u.scope, target_value=target,
                            target_unit=self.value_unit if target is not None else None, deadline=deadline,
                            success_criteria=u.success_criteria, assumptions=u.assumptions,
                            open_questions=u.open_questions)

@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -145,6 +145,11 @@ def _event_json(e: Event, refs: dict[str, str]) -> dict[str, Any]:
 
 class BriefIn(BaseModel):
     brief: str = Field(min_length=5, max_length=2000)
+
+
+class MemoryDecisionIn(BaseModel):
+    status: Literal["pinned", "rejected", "active"]
+    by: str = Field(min_length=2, max_length=80)
 
 
 class DecisionIn(BaseModel):
@@ -375,6 +380,28 @@ def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Cal
             r.resume(by=body.by, extra_tokens=body.extra_tokens)
             log_from(job, r)
         return ws().start("resume", work).model_dump()
+
+    @app.post("/api/missions/{mission_id}/learn", status_code=202)
+    async def learn(mission_id: str):
+        r = runner(mission_id)
+
+        async def work(job: Job):
+            out = await r.learn()
+            log_from(job, r)
+            return {"facts": len(out.get("facts", [])), "lessons": len(out.get("lessons", []))}
+        return ws().start("learn from the mission", work).model_dump()
+
+    @app.get("/api/memory")
+    def memory(scope: str | None = None, all: bool = False):
+        items = ws().rt.memory.list(scope_prefix=scope, statuses=None if all else ("pinned", "active"))
+        return [m.as_dict() for m in items]
+
+    @app.post("/api/memory/{memory_id}")
+    def decide_memory(memory_id: str, body: MemoryDecisionIn):
+        try:
+            return ws().rt.memory.decide(memory_id, body.status, by=body.by).as_dict()
+        except KeyError:
+            raise HTTPException(404, f"no memory {memory_id}")
 
     @app.post("/api/missions/{mission_id}/chat")
     async def chat(mission_id: str, body: ChatIn):

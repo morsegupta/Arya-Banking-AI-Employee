@@ -31,6 +31,29 @@ def role_prompt(rt: Runtime, name: str) -> str:
     return (rt.role_dir / path).read_text() if path else ""
 
 
+def mission_goal(rt: Runtime, mission_id: str | None) -> dict[str, Any]:
+    """The mission's goal from the role pack ({"name": ..., **config}); the first goal when the mission has
+    none yet (or for work outside a mission)."""
+    goals = role_cfg(rt).get("mission", {}).get("goals") or {"collect": {"measure": "settled_value",
+                                                                         "target": "from_brief"}}
+    name = None
+    if mission_id:
+        from core.mission import MissionStore
+        try:
+            m = MissionStore(rt.db, rt.events, rt.clock).get(mission_id)
+            name = m.spec.goal if m.spec else None
+        except KeyError:
+            pass
+    name = name if name in goals else next(iter(goals))
+    return {"name": name, **goals[name]}
+
+
+def purpose(rt: Runtime, mission_id: str | None, kind: str) -> str:
+    """Wording brief for a message the runtime sends on an event: the goal's, else the role pack's."""
+    return (mission_goal(rt, mission_id).get("purposes", {}).get(kind)
+            or role_cfg(rt)["outreach"].get("purposes", {}).get(kind) or kind.replace("_", " "))
+
+
 def company_facts(rt: Runtime) -> dict[str, Any]:
     return yaml.safe_load((rt.company_dir / "facts.yaml").read_text())
 
@@ -51,7 +74,10 @@ def format_money(minor_units: int, symbol: str = "₹") -> str:
 # --- operator tasks --------------------------------------------------------------------
 
 def make_operator(rt: Runtime) -> OperatorAgent:
-    notes = {name: m.notes for name, m in load_app_maps(rt.company_dir / "apps").items()}
+    from apps.memory import app_notes
+    maps = load_app_maps(rt.company_dir / "apps")
+    learned = app_notes(rt, list(maps))
+    notes = {name: [*m.notes, *learned.get(name, [])] for name, m in maps.items()}
     def quarantine_task(task, screening) -> None:
         rt.gate.quarantine(f"task:{task.id}", "a page or file in this task looked like a prompt-injection attempt",
                            screening.score)
@@ -180,7 +206,10 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
     attempts: list[str] = []
     budget = rt.budget(mission_id, 40_000)
     avoid: list[str] = []
-    for channel in channels or cfg["channel_order"]:
+    if not channels:
+        from apps.memory import channel_order
+        channels = channel_order(rt, counterparty, cfg["channel_order"])   # what worked before goes first
+    for channel in channels:
         to = contact.get(channel)
         if not to:
             attempts.append(f"{channel}: no address")

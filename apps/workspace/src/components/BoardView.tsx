@@ -4,7 +4,7 @@ import { api, type Board, inr } from "../api";
 import { Empty, Pill, STATE_STYLE } from "./ui";
 
 // Main flow left to right; side states appear only when something is in them.
-const MAIN = ["OVERDUE", "CONTACTED", "ACKNOWLEDGED", "PROMISED", "PARTIALLY_PAID", "PAID"];
+const MAIN = ["OVERDUE", "CONTACTED", "ACKNOWLEDGED", "CONFIRMED", "PROMISED", "PARTIALLY_PAID", "PAID"];
 
 export default function BoardView({ ctx }: { ctx: Ctx }) {
   const [board, setBoard] = useState<Board | null>(null);

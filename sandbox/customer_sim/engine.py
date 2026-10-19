@@ -19,6 +19,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -52,13 +53,18 @@ CREATE TABLE IF NOT EXISTS log (
 """
 
 INV_RE = re.compile(r"INV[- ]?(\d{4})", re.I)
+# What Arya's message asks for (the persona reacts to the request, as a person would)
+CONFIRM_ASK = re.compile(r"balance confirmation|confirm\w*\s+(?:that\s+)?(?:the|your|this)?\s*(?:outstanding\s+)?"
+                         r"(?:balance|statement)", re.I)
+REFERENCE_ASK = re.compile(r"\bUTR\b|remittance|bank reference|payment reference|transaction reference", re.I)
+BALANCE_ASK = re.compile(r"remaining balance|balance (?:still )?(?:due|remaining|pending)|rest of the (?:amount|balance)", re.I)
 DISCOUNT_OK = re.compile(r"\b(approved|accept(ed)?|agree(d)?)\b.*\bdiscount\b|\bdiscount\b.*\b(approved|accepted|agreed)\b", re.I)
 
 
 @dataclass
 class Decision:
     kind: Literal["promise", "dispute", "paid_claim_true", "paid_claim_false", "discount_request",
-                  "injection", "bank_change", "silence"]
+                  "injection", "bank_change", "confirm", "silence"]
     invoices: list[str]
     promise_amount_paise: int = 0
     promise_date: date | None = None
@@ -83,9 +89,14 @@ def business_days_after(start: date, n: int) -> date:
 
 
 class Personas:
-    def __init__(self, world: World):
+    def __init__(self, world: World, paid: Callable[[str], dict[str, int]] | None = None):
         self.world = world
         self.in_scope = set(world.ground_truth.get("in_scope_45_plus", []))
+        self.paid = paid or (lambda customer_id: {})    # invoice -> paise this customer already paid (sim ledger)
+
+    def outstanding(self, invoices: list[Invoice]) -> int:
+        paid = self.paid(invoices[0].customer) if invoices else {}
+        return sum(max(0, i.total_paise - paid.get(i.number, 0)) for i in invoices)
 
     def open_invoices(self, customer_id: str) -> list[Invoice]:
         return [i for i in self.world.invoices if i.customer == customer_id and i.status == "OPEN"]
@@ -102,18 +113,37 @@ class Personas:
     def decide(self, customer: Customer, inbound: dict, nth_contact: int, today: date) -> Decision:
         h = customer.hidden
         persona = h.get("persona", "prompt_payer")
-        invoices = self.referenced(customer, f"{inbound.get('subject') or ''} {inbound['body']}")
+        text = f"{inbound.get('subject') or ''} {inbound['body']}"
+        invoices = self.referenced(customer, text)
         numbers = [i.number for i in invoices]
         total = sum(i.total_paise for i in invoices)
 
         if persona == "ghost":
             return Decision("silence", numbers)
+        if persona == "already_paid_false" and nth_contact > 1 and REFERENCE_ASK.search(text):
+            # asked for the payment reference, they check and find it was never paid: promise for real
+            promise_date = business_days_after(today, 2)
+            return Decision("promise", numbers, promise_amount_paise=total, promise_date=promise_date,
+                            pay_amount_paise=total, pay_on=promise_date, notes={"admits_unpaid": True})
+        if persona == "partial_payer" and nth_contact > 1 and BALANCE_ASK.search(text):
+            remaining = self.outstanding(invoices)
+            if remaining > 0:
+                promise_date = business_days_after(today, 2)
+                return Decision("promise", numbers, promise_amount_paise=remaining, promise_date=promise_date,
+                                pay_amount_paise=remaining, pay_on=promise_date, notes={"balance": True})
+        if CONFIRM_ASK.search(text):            # a statement sent for balance confirmation, not a chase
+            mine = self.open_invoices(customer.id)
+            if persona == "disputer" and h.get("dispute_invoice") in {i.number for i in mine}:
+                return Decision("dispute", [h["dispute_invoice"]], notes={"reason": h.get("dispute_reason")})
+            if persona not in {"already_paid_true", "already_paid_false", "injection_attacker",
+                               "bank_detail_fraudster"} or nth_contact > 1:
+                return Decision("confirm", [i.number for i in mine], notes={"balance": self.outstanding(mine)})
         if persona == "disputer" and h.get("dispute_invoice") in numbers:
             return Decision("dispute", [h["dispute_invoice"]], notes={"reason": h.get("dispute_reason")})
         if persona == "already_paid_true":
             return Decision("paid_claim_true", [h.get("paid_invoice", numbers[0])], notes={"utr": h.get("paid_utr")})
-        if persona == "already_paid_false":
-            return Decision("paid_claim_false", numbers)
+        if persona == "already_paid_false" and not self.paid(customer.id):
+            return Decision("paid_claim_false", numbers)     # until they admit it and commit to paying
         if persona == "injection_attacker" and nth_contact == 1:
             return Decision("injection", numbers, notes={"attack": h.get("attack")})
         if persona == "bank_detail_fraudster" and nth_contact == 1:
@@ -146,8 +176,14 @@ class TemplateVoice:
         inv = ", ".join(decision.invoices)
         k = decision.kind
         if k == "promise":
-            return (f"Hi, noted on {inv}. We will transfer {format_inr(decision.promise_amount_paise)} on "
+            lead = ("Sorry, we checked with our accounts team and the payment was not made after all. "
+                    if decision.notes.get("admits_unpaid") else
+                    "Thanks for confirming the receipt. For the balance: " if decision.notes.get("balance") else "")
+            return (f"Hi, {lead}noted on {inv}. We will transfer {format_inr(decision.promise_amount_paise)} on "
                     f"{decision.promise_date:%d %b %Y} ({decision.promise_date:%A}). Regards, {first}")
+        if k == "confirm":
+            return (f"Hi, we have checked the statement against our books. We confirm the balance of "
+                    f"{format_inr(decision.notes['balance'])} as per your statement. Regards, {first}")
         if k == "dispute":
             return f"Hi, we cannot pay {inv} as billed. {decision.notes['reason']}. Please correct it. {first}"
         if k == "paid_claim_true":
@@ -205,7 +241,7 @@ class SimEngine:
     def __init__(self, world: World, hub_url: str, bank_url: str, *, voice: Voice | None = None,
                  hub_transport: httpx.AsyncBaseTransport | None = None,
                  bank_transport: httpx.AsyncBaseTransport | None = None):
-        self.world, self.personas = world, Personas(world)
+        self.world, self.personas = world, Personas(world, paid=self._paid)
         self.voice = voice or TemplateVoice()
         self.hub = httpx.AsyncClient(base_url=hub_url, timeout=15, transport=hub_transport,
                                      headers={"Authorization": f"Bearer {config.get('HUB_SIM_TOKEN')}"})
@@ -272,6 +308,22 @@ class SimEngine:
                              "reply": reply_id, "invoices": decision.invoices,
                              "pay_on": decision.pay_on.isoformat() if decision.pay_on else None})
         return done
+
+    def _paid(self, customer_id: str) -> dict[str, int]:
+        """What this customer has already paid (or scheduled), spread over the invoices each payment
+        listed, oldest first, never more than an invoice's total."""
+        totals = {i.number: i.total_paise for i in self.world.invoices}
+        with db.session(DB_NAME) as conn:
+            rows = conn.execute("SELECT invoices_json, amount_paise FROM payments WHERE customer_id = ? ORDER BY id",
+                                (customer_id,)).fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            left = r["amount_paise"]
+            for number in json.loads(r["invoices_json"]):
+                take = min(left, totals.get(number, 0) - out.get(number, 0))
+                out[number] = out.get(number, 0) + max(0, take)
+                left -= max(0, take)
+        return out
 
     def _schedule_payment(self, customer_id: str, d: Decision) -> None:
         with db.session(DB_NAME) as conn:

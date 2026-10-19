@@ -1,17 +1,21 @@
 """Orchestrator for one mission: turns events into agent work and guarded transitions.
 
 Wakes on:
-- new inbound messages  -> Reply Classifier -> propose ACKNOWLEDGED / PROMISED / DISPUTED, send
-                           requested documents; one message may cover several entities of one
-                           counterparty (a promised total is allocated oldest first)
+- new inbound messages  -> Reply Classifier -> propose ACKNOWLEDGED / PROMISED / the role pack's
+                           intent moves (DISPUTED, CONFIRMED), send requested documents; one message
+                           may cover several entities of one counterparty (a promised total is
+                           allocated oldest first). A dispute goes to a human with its documents.
 - timers (scheduler)    -> follow-up, promise reminder, promise check (-> BROKEN_PROMISE if no money)
-- the daily bank sync   -> Operator downloads the statement -> settle (match, receipt, verify, PAID)
+- the daily bank sync   -> Operator downloads the statement -> settle (match, receipt, verify, PAID);
+                           a partial payment -> ask for the balance; an "already paid" claim with no
+                           money found -> ask for the payment reference (never PAID on a claim)
 
 Agents propose; the pipeline's guards decide. Every step leaves events.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from datetime import datetime, timedelta
@@ -21,7 +25,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from agents.verifier_agent import FuzzyCriterion, VerifierAgent
-from apps.flows import conversation_facts, outreach, role_cfg, role_prompt
+from apps.flows import conversation_facts, format_money, outreach, purpose, role_cfg, role_prompt
 from apps.runtime import Runtime
 from apps.settlement import Settled, lookback, settle, statement_records
 from core.injection import redacted
@@ -45,6 +49,7 @@ class Orchestrator:
                                           tokenizer=rt.tokenizer)
         self.verifier = VerifierAgent(rt.llm, role_prompt=role_prompt(rt, "verifier"))
         self.sync_requested = False
+        self.last_sync_ok: bool | None = None     # did the latest bank sync actually read the bank?
         self.log: list[str] = []
         rt.bus.subscribe("timer.", self.on_timer)
 
@@ -157,9 +162,13 @@ class Orchestrator:
             self._event("message.classification_failed", routed[0], message_id=msg["id"], error=str(exc)[:300])
             self._say(f"{refs_txt}: could not classify {msg['id']}: {exc}")
             return {"message": msg["id"], "entity": refs_txt, "error": str(exc)}
+        moves_cfg = role_cfg(self.rt)["reply_classifier"].get("moves", {})
         targets = self._oldest_first([e for e in routed if e.external_ref in c.entity_refs])
+        if c.intent == "balance_confirmed":
+            targets = self._oldest_first(routed)     # a statement is confirmed as a whole
         for e in targets or routed[:1]:
-            self._event("message.classified", e, message_id=msg["id"], intent=c.intent, confidence=c.confidence,
+            self._event("message.classified", e, message_id=msg["id"], channel=msg["channel"], intent=c.intent,
+                        confidence=c.confidence,
                         quote=c.quote, amount=c.amount_minor, date=c.date.isoformat() if c.date else None,
                         refs=c.entity_refs, problems=c.problems)
         self._say(f"{refs_txt}: reply classified {c.intent} ({c.confidence:.2f})"
@@ -169,6 +178,17 @@ class Orchestrator:
         ctx = {**c.guard_context(), "message": {"id": msg["id"]}}
         if c.intent == "paid_claim":
             self.sync_requested = True      # a claim triggers a bank check; it never moves the entity itself
+            for e in targets or routed[:1]:
+                self.rt.pipeline.update_data(e.id, {"paid_claim": {"message_id": msg["id"], "channel": msg["channel"],
+                                                                   "quote": c.quote, "status": "open",
+                                                                   "at": self.rt.clock.now().isoformat()}})
+        if c.intent == "balance_confirmed":
+            tol = self.rt.pipeline.spec.constants.get("tolerance", 0)
+            owed = sum(int(e.data.get("balance", e.value)) for e in targets)
+            matches = c.amount_minor is None or abs(c.amount_minor - owed) <= tol
+            ctx["confirmation"] = {"amount_matches": matches, "amount": c.amount_minor, "owed": owed}
+            if not matches:
+                self._say(f"{refs_txt}: confirmation names {c.amount_minor}, our balance is {owed}: not a confirmation")
         if c.intent == "doc_request" and targets:
             await self.send_documents(targets, msg)
         if c.intent == "bank_detail_change":
@@ -184,6 +204,7 @@ class Orchestrator:
             tol = self.rt.pipeline.spec.constants.get("tolerance", 0)
             shares = allocate(c.amount_minor, [int(e.data.get("balance", e.value)) for e in targets], tol)
         results = []
+        newly_disputed: list[Entity] = []
         for e, share in zip(targets, shares):
             moves: list[tuple[str, dict]] = []
             if c.intent == "promise_to_pay" and share != 0:
@@ -194,8 +215,9 @@ class Orchestrator:
                     facts["promise_group"] = [t.external_ref for t in targets]
                     facts["promise_total"] = c.amount_minor
                 moves.append(("PROMISED", facts))
-            if c.intent == "dispute":
-                moves += [("ACKNOWLEDGED", {}), ("DISPUTED", {"dispute_quote": c.quote})]
+            if c.intent in moves_cfg:
+                moves += [(state, {f"{c.intent}_quote": c.quote} if i else {})
+                          for i, state in enumerate(moves_cfg[c.intent])]
             if not moves:
                 moves.append(("ACKNOWLEDGED", {}))
             for target, facts in moves:
@@ -217,8 +239,12 @@ class Orchestrator:
                                              subject=f"transition:{target}", mission_id=self.mission_id,
                                              entity_id=e.id)
                 results.append(f"{e.external_ref}:{tr.from_state}->{tr.to_state}:{'ok' if tr.ok else 'refused'}")
+                if tr.ok and target == "DISPUTED":
+                    newly_disputed.append(tr.entity)
                 self._say(f"{e.external_ref}: {tr.from_state} -> {target} "
                           + ("ok" if tr.ok else f"refused ({tr.reason}: {tr.guard.failures() if tr.guard else ''})"))
+        if newly_disputed:                  # once per dispute: a repeated complaint is already with a human
+            await self.hand_over_dispute(newly_disputed, msg, c)
         return {"message": msg["id"], "entity": refs_txt, "intent": c.intent, "moves": results}
 
     def escalate_failure(self, what: str, title: str, detail: dict[str, Any], next_step: str) -> None:
@@ -343,6 +369,87 @@ class Orchestrator:
                                     payload={"subject": "promise", **report.model_dump(mode="json")}))
         return report
 
+    async def hand_over_dispute(self, entities: list[Entity], msg: dict, c) -> None:
+        """Disputes are for humans: gather the documents that settle the facts (role pack `disputes`),
+        put them in front of a human with the customer's words, and tell the customer it is being
+        reviewed. Arya never resolves, concedes or chases a disputed entity."""
+        cfg = role_cfg(self.rt).get("disputes", {})
+        docs = []
+        for e in entities:
+            record = e.data.get("record", {})
+            fields = {**record, "ref": e.external_ref, "ref_digits": "".join(re.findall(r"\d+", e.external_ref))}
+            for template in cfg.get("documents", []):
+                try:
+                    rel = template.format(**fields)
+                except (KeyError, IndexError):
+                    continue
+                path = (self.rt.drive_dir / rel) if self.rt.drive_dir else None
+                if path and path.is_file():
+                    docs.append(str(path))
+            for d in e.data.get("documents", []):
+                full = (self.rt.drive_dir / d) if self.rt.drive_dir and not Path(d).is_absolute() else Path(d)
+                if full.is_file() and str(full) not in docs:
+                    docs.append(str(full))
+        docs = list(dict.fromkeys(docs))
+        for e in entities:
+            self.rt.evidence.collect([Evidence(kind="file", ref=d, summary=Path(d).name) for d in docs]
+                                     + [Evidence(kind="message", ref=msg["id"], summary=c.quote or msg["body"][:200],
+                                                 data={"from": msg["from_addr"], "channel": msg["channel"]})],
+                                     subject="dispute", mission_id=self.mission_id, entity_id=e.id)
+        refs = [e.external_ref for e in entities]
+        a = self.rt.approvals.request(
+            key=f"dispute:{self.mission_id}:{msg['id']}", kind="decision", mission_id=self.mission_id,
+            entity_id=entities[0].id, title=f"Dispute on {', '.join(refs)}: needs a human",
+            payload={"action": "dispute", "entity_ids": [e.id for e in entities], "quote": c.quote,
+                     "message_id": msg["id"], "documents": [Path(d).name for d in docs],
+                     "question": f"The customer wrote: {c.quote!r}. The invoice and the signed delivery note are "
+                                 "attached as evidence. Resolve it with the customer (credit note, or confirm the "
+                                 "invoice as billed). Arya will not chase the disputed invoice meanwhile."})
+        self._event("handoff.requested", entities[0], refs=refs, message_id=msg["id"], approval_id=a.id,
+                    reason="dispute", documents=[Path(d).name for d in docs])
+        out = await outreach(self.rt, self.mission_id, refs, step=f"dispute:{msg['id']}", transition_to=None,
+                             channels=[msg["channel"]], purpose=purpose(self.rt, self.mission_id, "dispute_ack"))
+        self._say(f"{','.join(refs)}: DISPUTE handed to a human ({a.id}) with {len(docs)} document(s); "
+                  f"customer told it is under review ({'; '.join(out.attempts)})")
+
+    async def chase_unmatched_claims(self) -> None:
+        """'Already paid' that the bank does not show: ask for the payment reference, once per claim."""
+        claims: dict[str, list[Entity]] = {}
+        unpaid = set(role_cfg(self.rt)["reconciliation"]["states"]) - {"PARTIALLY_PAID"}
+        for e in self.rt.pipeline.list(self.mission_id):
+            claim = e.data.get("paid_claim") or {}
+            if claim.get("status") != "open":
+                continue
+            if e.state in unpaid:
+                claims.setdefault(claim["message_id"], []).append(e)
+            else:                           # paid after all, or now a human's (disputed, escalated)
+                self.rt.pipeline.update_data(e.id, {"paid_claim": {**claim, "status": "closed", "state": e.state}})
+        for message_id, ents in claims.items():
+            claim = ents[0].data["paid_claim"]
+            out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents],
+                                 step=f"reference:{message_id}", transition_to=None, channels=[claim["channel"]],
+                                 purpose=purpose(self.rt, self.mission_id, "reference_request"))
+            if out.ok or out.replayed:
+                for e in ents:
+                    self.rt.pipeline.update_data(e.id, {"paid_claim": {**claim, "status": "reference_requested"}})
+            self._say(f"{','.join(e.external_ref for e in ents)}: claimed paid, no money found -> asked for the "
+                      f"payment reference ({'; '.join(out.attempts)})")
+
+    async def ask_for_balance(self, settled: list[Settled]) -> None:
+        """After a partial payment: thank the customer and ask when the balance will be paid."""
+        by_record: dict[str, list[Settled]] = {}
+        for s in settled:
+            if s.transition and s.transition.ok and s.transition.to_state == "PARTIALLY_PAID":
+                by_record.setdefault(s.match.record_id, []).append(s)
+        for record_id, items in by_record.items():
+            refs = [s.entity_ref for s in items]
+            received = sum(s.match.matched_amount for s in items)
+            out = await outreach(self.rt, self.mission_id, refs, step=f"balance:{record_id}", transition_to=None,
+                                 purpose=purpose(self.rt, self.mission_id, "balance_request"),
+                                 extra_facts={"received": format_money(received), "payment_reference": record_id})
+            self._say(f"{','.join(refs)}: partial payment {received} received -> asked for the balance "
+                      f"({'; '.join(out.attempts)})")
+
     # --- actions on a counterparty's group of entities -------------------------------------------
 
     def group_of(self, entity: Entity, states: set[str] | None = None) -> list[Entity]:
@@ -367,17 +474,26 @@ class Orchestrator:
         return out
 
     async def follow_up(self, entity: Entity, *, step: str = "followup1") -> Any:
-        """One follow-up for the entity's conversation, on the next channel after the one last used."""
+        """One follow-up for the entity's conversation, on the next channel after the one last used.
+        After the role pack's max_follow_ups unanswered follow-ups the conversation is NO_RESPONSE."""
         group = self.group_of(entity, {"CONTACTED"})
         if not group or any(e.data.get("last_contact", {}).get("step") == step for e in group):
             return None
-        order = role_cfg(self.rt)["outreach"]["channel_order"]
+        cfg = role_cfg(self.rt)["outreach"]
+        sent = {x["subject"] for x in self.rt.evidence.for_entity(group[0].id) if x["subject"].startswith("contact:followup")}
+        if cfg.get("max_follow_ups") is not None and len(sent) >= cfg["max_follow_ups"]:
+            for e in group:
+                tr = self.rt.pipeline.propose(e.id, "NO_RESPONSE", {}, actor="system",
+                                              facts={"follow_ups": len(sent)})
+                self._say(f"{e.external_ref}: {len(sent)} follow-ups unanswered -> NO_RESPONSE "
+                          f"{'ok' if tr.ok else tr.reason}")
+            return None
+        order = cfg["channel_order"]
         last = (group[0].data.get("last_contact") or {}).get("channel")
         channels = order[order.index(last) + 1:] + order[:order.index(last) + 1] if last in order else order
         out = await outreach(self.rt, self.mission_id, [e.external_ref for e in group], step=step,
                              transition_to=None, channels=channels,
-                             purpose="Follow-up: we have not heard back about the invoice(s) listed. Politely ask "
-                                     "for a payment date.")
+                             purpose=purpose(self.rt, self.mission_id, "follow_up"))
         self._say(f"{','.join(e.external_ref for e in group)}: follow-up " + "; ".join(out.attempts))
         return out
 
@@ -437,6 +553,7 @@ class Orchestrator:
         read = await statement_records(self.rt, self.mission_id, start, end)
         self._set_kv("last_sync", today.isoformat())
         self.sync_requested = False
+        self.last_sync_ok = read.records is not None
         if read.records is None:
             self._say(f"bank sync FAILED on every route: {read.attempts}")
             self.escalate_failure("bank_sync", f"Bank statement could not be read on {today}",
@@ -454,6 +571,7 @@ class Orchestrator:
                       + (f"{tr.from_state} -> {tr.to_state} {'ok' if tr.ok else 'refused: ' + tr.reason}" if tr else ""))
         if not settled:
             self._say("bank sync: no new matching payments")
+        await self.ask_for_balance(settled)
         return settled
 
     # --- one pass ---------------------------------------------------------------------------------
@@ -462,7 +580,10 @@ class Orchestrator:
         """One orchestration pass. Facts first (new messages, money in the bank), then timers, so a
         timer never acts on stale state (e.g. a payment reminder after the money already arrived)."""
         await self.process_inbox()
+        self.last_sync_ok = None
         await self.bank_sync()
+        if self.last_sync_ok:                   # only a bank we really read can say a claimed payment is missing
+            await self.chase_unmatched_claims()
         await self.rt.scheduler.fire_due()
 
 

@@ -20,6 +20,7 @@ from core.clock import Clock, FileClock, SystemClock
 from core.events import EventBus, EventStore
 from core.injection import InjectionGuard
 from core.llm import Budget, LLMClient, PersistentBudget
+from core.memory import MemoryStore
 from core.pii import Tokenizer
 from core.pipeline import Pipeline, load_pipeline
 from core.policy import PolicyGate
@@ -66,6 +67,7 @@ class Runtime:
     guard: InjectionGuard | None = None          # inbound messages and documents
     obs_guard: InjectionGuard | None = None      # tool observations (pages, files) on every Operator step
     evidence: EvidenceCollector | None = None
+    memory: MemoryStore | None = None          # long-lived: survives a reset of the working state
     _closers: list[Any] = field(default_factory=list)
 
     def mission_budget(self, mission_id: str | None) -> Budget | None:
@@ -164,4 +166,5 @@ def build_runtime(*, role: str = "collections", company: str = "sharma_distribut
                    registry=registry, sessions=sessions, pipeline=pipeline, llm=llm,
                    artifacts_dir=artifacts, drive_dir=roots.drive_root, policies=policies, approvals=approvals,
                    gate=gate, guard=guard, obs_guard=obs_guard, evidence=EvidenceCollector(db, clock),
+                   memory=MemoryStore(Database(var / "memory" / "memory.db"), clock, events),
                    _closers=[hub, erp])

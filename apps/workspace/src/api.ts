@@ -17,7 +17,8 @@ export type Draft = { channel: string; to: string; subject?: string | null; body
 
 export type Mission = {
   id: string; brief: string; status: string; created_at: string;
-  spec: null | { objective: string; scope: string; target_value: number | null; deadline: string | null;
+  spec: null | { objective: string; goal?: string | null; scope: string; target_value: number | null;
+    target_unit?: string | null; deadline: string | null;
     success_criteria: string[]; assumptions: string[]; open_questions: string[] };
   plan: null | { summary: string; batches: { name: string; groups: string[]; approach: string; start_day: number; rationale: string }[];
     expected_value: number | null; risks: string[]; human_asks: string[]; problems: string[] };
@@ -52,6 +53,11 @@ export type Approval = {
   mission_id?: string | null; entity_id?: string | null; ref?: string | null; payload: Record<string, any>;
 };
 
+export type MemoryItem = {
+  id: string; scope: string; kind: "fact" | "lesson" | "playbook"; key: string; text: string; status: string;
+  source?: string | null; decided_by?: string | null; updated_at: string; cites: string[];
+};
+
 export type ChatTurn = { at: string; by: string; question: string; answer: string; refs: string[]; groups: string[]; confidence: number };
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -78,6 +84,10 @@ export const api = {
   day: (id: string) => req<Job>(`/api/missions/${id}/day`, { method: "POST" }),
   resume: (id: string, by: string, extra_tokens: number) =>
     req<Job>(`/api/missions/${id}/resume`, { method: "POST", body: JSON.stringify({ by, extra_tokens }) }),
+  memory: (all = false) => req<MemoryItem[]>(`/api/memory${all ? "?all=true" : ""}`),
+  decideMemory: (id: string, status: "pinned" | "rejected" | "active", by: string) =>
+    req<MemoryItem>(`/api/memory/${id}`, { method: "POST", body: JSON.stringify({ status, by }) }),
+  learn: (id: string) => req<Job>(`/api/missions/${id}/learn`, { method: "POST" }),
   chat: (id: string, question: string, by: string) =>
     req<ChatTurn>(`/api/missions/${id}/chat`, { method: "POST", body: JSON.stringify({ question, by }) }),
 };

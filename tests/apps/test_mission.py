@@ -32,8 +32,10 @@ def _untrusted(messages) -> str:
 def router(messages):
     system = messages[0]["content"]
     payload = json.loads(messages[1]["content"])
+    if system.startswith("You are the Memory Writer"):
+        return {"lessons": []}
     if "TASK: understand" in system:
-        return {"objective": "Collect overdue receivables", "scope": "OPEN invoices 45+ days overdue",
+        return {"objective": "Collect overdue receivables", "goal": "collect", "scope": "OPEN invoices 45+ days overdue",
                 "target_text": re.search(r"₹\d+L", payload["BRIEF"]).group(0), "deadline": "2026-10-23",
                 "selection": {"min_days_overdue": 45},
                 "success_criteria": ["₹12L verified in the bank"], "assumptions": [], "open_questions": []}
@@ -54,6 +56,14 @@ def router(messages):
             body = f"Our bank details have not changed. Please pay only to A/c {payload['COMPANY_FACTS']['bank_account_number']}."
         if "approved the concession" in payload["PURPOSE"]:
             body = "Good news: the discount you asked for is approved. Please confirm the payment date."
+        if "bank reference (UTR)" in payload["PURPOSE"]:
+            body = "We could not find the payment. Please share the UTR or the remittance advice."
+        if "remaining balance" in payload["PURPOSE"]:
+            body = "Thank you for the payment received. When will the remaining balance be paid?"
+        if payload["PURPOSE"].startswith("Balance confirmation"):
+            body = "Please confirm the balance on the attached statement of account."
+        if "disputes the invoice" in payload["PURPOSE"]:
+            body = "Thank you. Our accounts team is reviewing it against the signed delivery note."
         return {"subject": "Overdue invoices" if email else None, "body": body,
                 "attachments": payload["AVAILABLE_DOCUMENTS"], "facts_used": []}
     if "You classify one message" in system:

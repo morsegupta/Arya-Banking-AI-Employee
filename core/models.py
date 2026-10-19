@@ -42,6 +42,7 @@ class MissionStatus(StrEnum):
 class MissionSpec(BaseModel):
     """What the Mission Agent understood from a brief."""
     objective: str
+    goal: str | None = None         # one of the role pack's mission goals (how progress is measured)
     scope: str                      # human-readable entity selection rule
     target_value: int | None = None  # in the role pack's unit (smallest currency unit, count...); None if not numeric
     target_unit: str | None = None

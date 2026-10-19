@@ -9,6 +9,7 @@
     mission_plan         approve -> mission ACTIVE                        reject -> replan with the reason
     budget               approve -> resume with double the token budget   reject -> stays paused
     failure              (information for a human; nothing automatic)
+    dispute              (a human resolves it with the customer; documents attached; nothing automatic)
 """
 
 from __future__ import annotations

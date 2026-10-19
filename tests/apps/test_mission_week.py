@@ -8,9 +8,12 @@ the real page snapshots it is shown.
 Scenarios checked against the world's hidden ground truth:
 - already paid before the mission (Mehta): reconciled on day 0 and never chased,
 - one transfer for three invoices (Initech): all three PAID from one bank line,
-- partial payer (Patel): PARTIALLY_PAID with the right balance left,
-- look-alike payer (SUNRISE TRADING CO vs Sunrise Hardware): never matched,
-- disputer: DISPUTED, ghost: followed up on the next channel,
+- partial payer (Patel): PARTIALLY_PAID with the right balance left, then asked for the balance and
+  a new promise for exactly the remainder (scenario 2),
+- "already paid" that is not (Sunrise): never PAID on the claim, the look-alike SUNRISE TRADING CO
+  credit never matched; asked for the payment reference, admits it, pays for real (scenario 2),
+- disputer: DISPUTED and handed to a human once, with the invoice and the signed delivery note
+  (scenario 3); ghost: followed up on the next channel,
 - zero false "paid", and verified value equals the money really matched.
 """
 
@@ -134,14 +137,33 @@ def test_mission_week(servers, sandbox_var, asgi, world):  # noqa: F811
     utrs = {erp_invoice(servers, r)["receipts"][0]["reference"] for r in ("INV-2270", "INV-2275", "INV-2288")}
     assert len(utrs) == 1, "all three settled by the same bank line"
 
-    # partial payer
-    assert final["INV-2284"] == "PARTIALLY_PAID", log
+    # partial payer: balance left, asked for it, new promise for exactly the remainder
     patel = next(e for e in rt.pipeline.list(runner.mission_id) if e.external_ref == "INV-2284")
     assert patel.data["balance"] == erp_invoice(servers, "INV-2284")["balance_paise"] == 75_000_00
+    moves = {(e.entity_id, e.payload["to"]) for e in rt.events.query(mission_id=runner.mission_id,
+                                                                     types=["entity.transitioned"], limit=100000)}
+    assert (patel.id, "PARTIALLY_PAID") in moves, log
+    assert "INV-2284: partial payment 7500000 received -> asked for the balance" in log
+    assert final["INV-2284"] == "PROMISED" and patel.data["facts"]["promise_amount"] == 75_000_00, log
 
-    # look-alike payer never matches; "already paid" claim without money is not paid
-    assert final["INV-2279"] != "PAID" and not erp_invoice(servers, "INV-2279")["receipts"]
+    # "already paid" without money: never PAID on the claim; asked for the reference; the look-alike
+    # credit (SUNRISE TRADING CO) is never applied; PAID only from the customer's own later transfer
+    asked = log.index("INV-2279: claimed paid, no money found -> asked for the payment reference (email: delivered")
+    assert "INV-2279: reply classified paid_claim" in log[:asked]
+    assert "-> PAID" not in "".join(line for line in log[:asked].splitlines() if "INV-2279" in line), log
+    receipts = erp_invoice(servers, "INV-2279")["receipts"]
+    assert all(r["reference"] not in world.ground_truth["bank_lures"] for r in receipts)
+    if final["INV-2279"] == "PAID":
+        sunrise = [p for p in SimEngine.ground_truth()["payments"] if p["customer_id"] == "C05" and p["status"] == "PAID"]
+        assert sunrise and receipts[0]["reference"] == sunrise[0]["utr"]
+
+    # dispute: one hand-over to a human with the documents, the customer told it is under review
     assert final["INV-2296"] == "DISPUTED"
+    disputes = [a for a in rt.approvals.list() if a.payload.get("action") == "dispute"]
+    assert len(disputes) == 1, [a.title for a in disputes]
+    assert set(disputes[0].payload["documents"]) == {"DN-2296.pdf", "INV-2296.pdf"}
+    lakshmi = asyncio.run(_inbox(asgi, "lakshmi@kaverikirana.example"))
+    assert any("reviewing it against the signed delivery note" in m["body"] for m in lakshmi)
 
     # ghost: follow-up on the next channel after the email went unanswered
     priya = asyncio.run(_inbox(asgi, "+919000010008"))

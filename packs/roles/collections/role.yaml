@@ -5,7 +5,7 @@ entity: invoice
 value_unit: paise                 # entity.value and money facts are integer paise
 
 pipeline:
-  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, PAID,
+  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, CONFIRMED, PROMISED, PARTIALLY_PAID, PAID,
            BROKEN_PROMISE, DISPUTED, NO_RESPONSE, ESCALATED, WRITTEN_OFF]
   initial: [OVERDUE]
   terminal: [PAID, WRITTEN_OFF]
@@ -22,25 +22,32 @@ pipeline:
       to: ACKNOWLEDGED
       guard: { all: [ "classifier.about_entity == true", "evidence.quote exists" ] }
 
-    - from: [CONTACTED, ACKNOWLEDGED]
+    # The customer confirms the balance we stated is what they owe (a balance confirmation): a quoted
+    # message, and any amount they name must equal our balance. Debt acknowledged, not money.
+    - from: [CONTACTED, ACKNOWLEDGED, NO_RESPONSE]
+      to: CONFIRMED
+      guard: { all: [ "classifier.intent == 'balance_confirmed'", "classifier.confidence >= min_confidence",
+                      "evidence.quote exists", "confirmation.amount_matches == true" ] }
+
+    - from: [CONTACTED, ACKNOWLEDGED, CONFIRMED]
       to: PROMISED
       guard: { all: [ "classifier.intent == 'promise_to_pay'", "classifier.confidence >= min_confidence",
                       "facts.promise_amount > 0", "facts.promise_date exists", "evidence.quote exists" ,
                       "verifier.pass == true" ] }
 
-    - from: ACKNOWLEDGED
+    - from: [ACKNOWLEDGED, CONFIRMED]
       to: DISPUTED
       guard: { all: [ "classifier.intent == 'dispute'", "classifier.confidence >= min_confidence",
                       "evidence.quote exists" ] }
 
     # "Paid" needs money in the bank, matched to this invoice, and an ERP receipt, and the Verifier.
     # A customer's claim alone can never satisfy this guard.
-    - from: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
+    - from: [OVERDUE, CONTACTED, ACKNOWLEDGED, CONFIRMED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
       to: PAID
       guard: { all: [ "matcher.matched_amount >= entity.balance - tolerance", "matcher.counterparty_matches == true",
                       "matcher.record_id exists", "erp.receipt_exists == true", "verifier.pass == true" ] }
 
-    - from: [PROMISED, CONTACTED, ACKNOWLEDGED]
+    - from: [PROMISED, CONTACTED, ACKNOWLEDGED, CONFIRMED]
       to: PARTIALLY_PAID
       guard: { all: [ "matcher.matched_amount > 0", "matcher.matched_amount < entity.balance - tolerance",
                       "matcher.counterparty_matches == true", "erp.receipt_exists == true", "verifier.pass == true" ] }
@@ -72,7 +79,7 @@ pipeline:
       to: CONTACTED
       guard: { all: [ "outreach.delivered == true", "outreach.message_id exists" ] }
 
-    - from: [ACKNOWLEDGED, DISPUTED, NO_RESPONSE, BROKEN_PROMISE]
+    - from: [ACKNOWLEDGED, CONFIRMED, DISPUTED, NO_RESPONSE, BROKEN_PROMISE]
       to: ESCALATED
 
     - from: ESCALATED
@@ -117,6 +124,21 @@ entity_source:
 outreach:
   purpose: "First reminder for an overdue invoice: ask the customer for a payment date."
   channel_order: [email, whatsapp]
+  max_follow_ups: 2               # after this many unanswered follow-ups: NO_RESPONSE (then a human)
+  # Messages the orchestrator sends on events. A mission goal may override any of them (goals.*.purposes).
+  purposes:
+    follow_up: "Follow-up: we have not heard back about the invoice(s) listed. Politely ask for a payment date."
+    reference_request: >-
+      The customer said this was already paid, but we could not find the payment in our bank. Thank them,
+      and politely ask for the payment details so we can trace it: date, amount, and the bank reference
+      (UTR) or a remittance advice. Do not say they are wrong; do not ask them to pay again.
+    balance_request: >-
+      Thank the customer for the payment we received (amount in RECEIVED). The invoice(s) still have a
+      balance due (the balance fields). Politely ask when the remaining balance will be paid.
+    dispute_ack: >-
+      The customer disputes the invoice(s) listed. Acknowledge their message, say our accounts team is
+      reviewing it against the signed delivery note and will reply within 2 working days. Do not admit
+      fault, do not offer a credit or discount, and do not ask for payment of the disputed invoice.
 
 prompts:
   operator: prompts/operator.md
@@ -136,7 +158,26 @@ reply_classifier:
     bank_detail_change: "asks to pay to different bank details, or says the supplier's details changed"
     not_now: "acknowledges the message without any commitment"
     opt_out: "asks the company to stop contacting them"
+    balance_confirmed: "confirms that the balance or statement of account sent to them is correct (agrees the amount owed)"
     unclear: "none of the above, or cannot tell"
+  # Intents that move entities without special handling: intent -> states proposed in order (each
+  # guarded). Facts recorded: {intent}_quote. Promises, paid claims, documents, discounts and bank-detail
+  # changes have their own flows in the orchestrator.
+  moves:
+    dispute: [ACKNOWLEDGED, DISPUTED]
+    balance_confirmed: [ACKNOWLEDGED, CONFIRMED]
+
+# Disputes are resolved by humans. Documents gathered for them (on the shared drive; the invoice's own
+# documents are added too). Fields: the entity's record, plus ref and ref_digits.
+disputes:
+  documents: ["delivery_notes/DN-{ref_digits}.pdf"]
+
+# Memory (Day 3): what the employee learns about counterparties across missions.
+memory:
+  counterparty_scope: customer     # memory scope prefix: customer:C01
+  commitment: { state: PROMISED, date_fact: promise_date, kept: [PAID, PARTIALLY_PAID], broken: [BROKEN_PROMISE] }
+  contested: [DISPUTED]
+  forecast_state: PROMISED         # a customer's remembered promise-kept rate replaces this state's weight
 
 # Verifier settings (deterministic checks always; a second LLM opinion only when needed).
 verification:
@@ -146,7 +187,7 @@ verification:
 
 # Matching money records (bank statement lines) to entities.
 reconciliation:
-  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
+  states: [OVERDUE, CONTACTED, ACKNOWLEDGED, CONFIRMED, PROMISED, PARTIALLY_PAID, BROKEN_PROMISE]
   counterparty_field: customer_name
   order_field: due_date           # allocation order when one payment covers several invoices
   lookback_days: 21
@@ -164,23 +205,59 @@ mission:
       min_days_overdue: { type: integer, description: "Only invoices at least this many days past their due date" }
       max_days_overdue: { type: integer, description: "Only invoices at most this many days past their due date" }
       customer_id: { type: string, description: "Only this customer (ERP customer id, e.g. C02)" }
+      # scope: group -> not sent to the list tool: code keeps a customer only when `keep` holds, with
+      # group.total = the customer's listed open value and param = the parsed value.
+      # type: money -> the amount exactly as the brief writes it ("₹1L", "1,00,000"); code parses it.
+      min_group_value: { type: money, scope: group, keep: "group.total >= param",
+                         description: "Only customers whose total outstanding (all their listed open invoices) is at least this amount, written exactly as in the brief (e.g. \"₹1L\")" }
     group_tool: erp.list_customers   # the counterparties; one contact covers all of a customer's invoices
     group_key: customer_id
     exclude:
       - { when: "group.legal_hold == true", reason: "customer on legal hold: only the legal team may contact them" }
       - { when: "group.payment_plan == true", reason: "customer is on an agreed payment plan" }
       - { when: "item.status == 'DISPUTED'", reason: "invoice is under dispute" }
-      - { when: "item.days_overdue <= 0", reason: "invoice is not yet due" }
+      - { when: "item.days_overdue <= 0", reason: "invoice is not yet due", goals: [collect] }   # chasing only
 
-  success_criteria:
-    - "Only money matched in the bank, posted as an ERP receipt and verified counts towards the target"
+  # What a brief can ask for. The Mission Agent picks one goal; code measures progress and decides
+  # completion the way the goal says, so a new kind of brief needs a goal here, not new code.
+  #   measure: settled_value    sum of settled, verified value (settlement ledger); target from the brief
+  #   measure: groups_reached   counterparties whose entities have all reached one of `states`
+  #                             (each reach is a guarded transition with evidence); target: all_groups
+  goals:
+    collect:
+      description: "Bring money in: reminders and follow-ups until invoices are paid. The target is an amount."
+      measure: settled_value
+      target: from_brief
+      success_criteria:
+        - "Only money matched in the bank, posted as an ERP receipt and verified counts towards the target"
+      approaches: [soft_reminder, firm_with_statement]
+      levers: [retry_contact, follow_up, send_statement, re_engage, escalate, propose_payment_plan, check_bank]
+    confirm_balance:
+      description: >-
+        Balance confirmation: send each customer a statement of account and get them to confirm the
+        balance in writing. Not a payment chase. The target is every customer in scope.
+      measure: groups_reached
+      states: [CONFIRMED, PAID]
+      target: all_groups
+      unit: customers
+      success_criteria:
+        - "Every customer in scope confirms in writing that the balance on their statement is correct (a quoted reply; any amount they name equals our balance)"
+      approaches: [statement_confirmation]
+      levers: [retry_contact, follow_up, escalate]
+      purposes:
+        follow_up: >-
+          Follow-up: we have not heard back about the statement of account we sent. Politely ask them to
+          confirm the balance, or to tell us which items differ. Do not ask for payment.
+      # chance that a customer in each state confirms before the deadline (forecast prior)
+      forecast_weights: { OVERDUE: 0.6, CONTACTED: 0.6, ACKNOWLEDGED: 0.75, CONFIRMED: 1.0, PROMISED: 0.5,
+                          PARTIALLY_PAID: 0.5, BROKEN_PROMISE: 0.2, NO_RESPONSE: 0.1, DISPUTED: 0.0, ESCALATED: 0.0 }
 
   capacity_per_day: 6              # customers contacted for the first time per day
   minor_units: 100                 # targets in briefs are rupees
 
   # Probability that value in each state turns into verified money by a week-long deadline (forecast
   # prior; memory will replace it with this company's own history).
-  forecast_weights: { OVERDUE: 0.35, CONTACTED: 0.45, ACKNOWLEDGED: 0.5, PROMISED: 0.8, PARTIALLY_PAID: 0.6,
+  forecast_weights: { OVERDUE: 0.35, CONTACTED: 0.45, ACKNOWLEDGED: 0.5, CONFIRMED: 0.6, PROMISED: 0.8, PARTIALLY_PAID: 0.6,
                       BROKEN_PROMISE: 0.25, NO_RESPONSE: 0.1, DISPUTED: 0.0, ESCALATED: 0.1 }
 
   approaches:
@@ -194,6 +271,13 @@ mission:
         Firm but polite reminder: the invoice(s) listed are well past due. A statement of account is
         attached. Ask the customer to confirm a payment date for the full balance.
       documents: [entity, statement_of_account]
+    statement_confirmation:
+      description: "Statement of account sent for balance confirmation. No payment request."
+      purpose: >-
+        Balance confirmation: the attached statement of account lists every open invoice and the total
+        balance. Ask the customer to check it against their books and reply confirming the balance, or
+        tell us which items differ. This is not a payment reminder: do not ask for payment or a date.
+      documents: [statement_of_account]
 
   # What the Mission Agent may ask for on a tick. `states`: the lever applies to groups with an entity
   # in one of these states. The runtime executes levers; some need human approval.
@@ -211,7 +295,7 @@ mission:
       min_days_since_contact: 3
     send_statement:
       description: "Send the customer a statement of account of all their open invoices."
-      states: [CONTACTED, ACKNOWLEDGED, BROKEN_PROMISE]
+      states: [CONTACTED, ACKNOWLEDGED, CONFIRMED, BROKEN_PROMISE]
       min_days_since_contact: 2
     re_engage:
       description: "Contact a customer again after a broken promise (once)."

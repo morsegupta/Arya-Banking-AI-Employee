@@ -15,6 +15,11 @@
     python -m apps.cli mission run [--days 5] [--sim-llm]     tick daily with simulated customers
 
     python -m apps.cli approvals [list|show|approve|reject] [id] [--by name] [--note text]
+
+    python -m apps.cli memory [list] [--scope customer:C12]    what the employee remembers
+    python -m apps.cli memory learn [--id mis_...]             Memory Writer pass over a mission
+    python -m apps.cli memory pin|reject|restore mem_... --by "Priya"
+    python -m apps.cli memory forget                           erase all memory (asks for --yes)
 """
 
 from __future__ import annotations
@@ -225,9 +230,11 @@ def _show(runner) -> None:
 
 def _board(runner) -> None:
     p = runner.progress()
-    target = format_money(p.target) if p.target is not None else "-"
-    print(f"  verified {format_money(p.verified)} of {target}   expected {format_money(p.expected)}"
-          + (f"   gap {format_money(p.gap)}" if p.gap is not None else ""))
+    unit = runner.goal().get("unit")
+    fmt = (lambda v: f"{v} {unit}") if unit else format_money          # a goal that counts, not money
+    target = fmt(p.target) if p.target is not None else "-"
+    print(f"  {'done' if unit else 'verified'} {fmt(p.verified)} of {target}   expected {fmt(p.expected)}"
+          + (f"   gap {fmt(p.gap)}" if p.gap is not None else ""))
     for row in runner.group_rows():
         items = ", ".join(f"{i['ref']} {i['state']}" + (f" (promised {i['promise_date']})" if i.get("promise_date")
                                                         else "") for i in row["items"])
@@ -377,6 +384,36 @@ async def cmd_approvals(args) -> None:
         await rt.close()
 
 
+async def cmd_memory(args) -> None:
+    rt = build_runtime(use_llm=args.action == "learn")
+    try:
+        if args.action == "list":
+            items = rt.memory.list(scope_prefix=args.scope, statuses=None if args.all else ("pinned", "active"))
+            if not items:
+                print("  nothing remembered yet")
+            for m in items:
+                print(f"  {m.id} [{m.scope}] {m.kind:<8} {m.status:<8} {m.text}")
+            return
+        if args.action == "learn":
+            from apps.mission import MissionRunner
+            runner = MissionRunner(rt, _mission_id(rt, args))
+            await runner.learn()
+            _flush_runner(runner, 0)
+            return
+        if args.action == "forget":
+            if not args.yes:
+                raise SystemExit("this erases everything the employee learned; repeat with --yes")
+            print(f"  {rt.memory.forget()} memories erased")
+            return
+        if not args.memory_id:
+            raise SystemExit("which memory? pass its id")
+        status = {"pin": "pinned", "reject": "rejected", "restore": "active"}[args.action]
+        m = rt.memory.decide(args.memory_id, status, by=args.by)
+        print(f"  {m.id} [{m.scope}] {m.status} by {m.decided_by}: {m.text}")
+    finally:
+        await rt.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="arya")
     p.add_argument("--mission", default=MISSION)
@@ -412,15 +449,24 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--by", default="finance_manager")
     ap.add_argument("--note", default="")
     ap.add_argument("--all", action="store_true", help="include decided approvals")
+    me = sub.add_parser("memory")
+    me.add_argument("action", nargs="?", default="list", choices=["list", "learn", "pin", "reject", "restore", "forget"])
+    me.add_argument("memory_id", nargs="?")
+    me.add_argument("--scope", default=None, help="e.g. customer:C12 or app:")
+    me.add_argument("--id", default=None, help="with learn: the mission (default: current)")
+    me.add_argument("--by", default="finance_manager")
+    me.add_argument("--all", action="store_true", help="include rejected memories")
+    me.add_argument("--yes", action="store_true")
     args = p.parse_args(argv)
     from sandbox.common import config
     from sandbox.common.runlock import Busy, run_lock
     handler = {"fetch": cmd_fetch, "statement": cmd_statement, "outreach": cmd_outreach, "step": cmd_step,
                "status": cmd_status, "demo": cmd_demo, "entities": cmd_entities, "events": cmd_events,
-               "mission": cmd_mission, "approvals": cmd_approvals}[args.cmd]
+               "mission": cmd_mission, "approvals": cmd_approvals, "memory": cmd_memory}[args.cmd]
     read_only = (args.cmd in {"entities", "events", "status"}
                  or (args.cmd == "mission" and args.action in {"show", "board"})
-                 or (args.cmd == "approvals" and args.action in {"list", "show"}))
+                 or (args.cmd == "approvals" and args.action in {"list", "show"})
+                 or (args.cmd == "memory" and args.action == "list"))
     if read_only:
         asyncio.run(handler(args))
         return

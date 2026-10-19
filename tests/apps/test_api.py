@@ -83,6 +83,15 @@ def test_brief_to_first_day_through_the_api(client):
     feed = c.get(f"/api/events?mission_id={mid}").json()
     assert any(f["text"].startswith("INV-2263: OVERDUE → PAID") for f in feed)
 
+    # memory: facts learned from the day; a human can reject one, and it is no longer used
+    wait(c, c.post(f"/api/missions/{mid}/learn").json())
+    remembered = c.get("/api/memory?scope=customer:").json()
+    assert remembered and all(m["status"] == "active" for m in remembered)
+    one = remembered[0]["id"]
+    assert c.post(f"/api/memory/{one}", json={"status": "rejected", "by": "Priya (FM)"}).json()["status"] == "rejected"
+    assert one not in {m["id"] for m in c.get("/api/memory").json()}
+    assert c.post("/api/memory/mem_nope", json={"status": "pinned", "by": "Priya"}).status_code == 404
+
 
 def test_one_job_at_a_time_and_unknown_things_are_404(client):
     c = client

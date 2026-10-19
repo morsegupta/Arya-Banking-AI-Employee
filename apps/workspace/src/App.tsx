@@ -8,8 +8,9 @@ import Chat from "./components/Chat";
 import Activity from "./components/Activity";
 import EntityDrawer from "./components/EntityDrawer";
 import JobBar from "./components/JobBar";
+import MemoryView from "./components/MemoryView";
 
-export type View = "home" | "mission" | "board" | "approvals" | "chat" | "activity";
+export type View = "home" | "mission" | "board" | "approvals" | "chat" | "memory" | "activity";
 
 const NAV: { id: View; label: string; icon: string }[] = [
   { id: "home", label: "Home", icon: "◎" },
@@ -17,6 +18,7 @@ const NAV: { id: View; label: string; icon: string }[] = [
   { id: "board", label: "Invoices", icon: "▦" },
   { id: "approvals", label: "Approvals", icon: "✓" },
   { id: "chat", label: "Ask Arya", icon: "✦" },
+  { id: "memory", label: "Memory", icon: "◈" },
   { id: "activity", label: "Activity", icon: "≡" },
 ];
 
@@ -166,6 +168,7 @@ export default function App() {
           {view === "board" && <BoardView ctx={ctx} />}
           {view === "approvals" && <Approvals ctx={ctx} />}
           {view === "chat" && <Chat ctx={ctx} />}
+          {view === "memory" && <MemoryView ctx={ctx} />}
           {view === "activity" && <Activity ctx={ctx} />}
         </div>
       </main>

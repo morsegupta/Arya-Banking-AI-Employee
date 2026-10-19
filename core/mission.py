@@ -179,9 +179,16 @@ class Progress:
 
 
 def progress(target: int | None, verified: int, open_by_state: dict[str, int],
-             weights: dict[str, float]) -> Progress:
-    """Forecast = verified + sum(open value in state * probability that state turns into money)."""
-    expected = verified + int(sum(v * float(weights.get(s, 0.0)) for s, v in open_by_state.items()))
+             weights: dict[str, float], *, priors: dict[str, list[tuple[int, float]]] | None = None) -> Progress:
+    """Forecast = verified + sum(open value in state * probability that state turns it into progress).
+    `priors`: per state, (value, probability) for parts of that state's value with their own history
+    (e.g. a counterparty's remembered promise-kept rate); the rest uses the state's weight."""
+    priors = priors or {}
+    expected = verified
+    for s, v in open_by_state.items():
+        own = priors.get(s, [])
+        rest = v - sum(value for value, _ in own)
+        expected += int(rest * float(weights.get(s, 0.0)) + sum(value * p for value, p in own))
     return Progress(target=target, verified=verified, open_by_state=open_by_state, expected=expected,
                     gap=None if target is None else max(0, target - verified),
                     expected_shortfall=None if target is None else target - expected)

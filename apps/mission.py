@@ -9,7 +9,10 @@
                    -> COMPLETED if verified >= target -> Mission Agent reviews once a day and
                    chooses levers, which code executes
 
-Collected value is read from the settlement ledger (matched, posted, verified), never from promises.
+What counts as progress is the mission goal's (role pack `mission.goals`): for `collect`, value read
+from the settlement ledger (matched, posted, verified), never from promises; for a goal measured by
+`groups_reached`, counterparties whose entities all reached the goal's states through guarded transitions.
+Completion is re-observed in the systems of record either way.
 """
 
 from __future__ import annotations
@@ -18,9 +21,11 @@ from datetime import date, datetime
 from typing import Any
 
 from agents.mission_agent import MissionAgent
-from apps.flows import _read, load_entity, outreach, role_cfg, role_prompt
+from apps.flows import _read, load_entity, mission_goal, outreach, role_cfg, role_prompt
+from apps.memory import counterparty_memory, distill, remember_facts
 from apps.orchestrator import Orchestrator
 from apps.runtime import Runtime
+from apps.confirmations import fresh_confirmations
 from apps.settlement import ensure_ledger, fresh_verified_total, peek_payments
 from core.guards import compile_guard, evaluate
 from core.injection import redacted
@@ -74,6 +79,26 @@ class MissionRunner:
     def _group_of(self, e: Entity) -> str:
         return str(e.data.get("record", {}).get(self.mcfg["selection"]["group_key"]))
 
+    # --- goal ------------------------------------------------------------------------------------
+
+    def goal(self) -> dict[str, Any]:
+        """The mission's goal from the role pack (name, measure, target, approaches, levers...)."""
+        return mission_goal(self.rt, self.mission_id)
+
+    def approaches(self) -> dict[str, dict[str, Any]]:
+        allowed = self.goal().get("approaches")
+        return {k: v for k, v in self.mcfg["approaches"].items() if not allowed or k in allowed}
+
+    def levers(self) -> dict[str, dict[str, Any]]:
+        allowed = self.goal().get("levers")
+        return {k: v for k, v in self.mcfg["levers"].items() if not allowed or k in allowed}
+
+    def forecast_weights(self) -> dict[str, float]:
+        return self.goal().get("forecast_weights") or self.mcfg.get("forecast_weights", {})
+
+    def counts_groups(self) -> bool:
+        return self.goal().get("measure") == "groups_reached"
+
     async def _policy_text(self) -> str:
         texts = []
         for path in self.rt.company_cfg.get("policy_docs", []):
@@ -105,15 +130,23 @@ class MissionRunner:
     async def understand(self) -> Mission:
         m = self.mission
         params = self.mcfg["selection"]["params"]
+        goals = {k: " ".join(str(v.get("description", k)).split()) for k, v in self.mcfg.get("goals", {}).items()}
         u = await self.agent.understand(m.brief, today=self._today(), selection_params=params,
                                         policy=await self._policy_text(), answers=m.data.get("answers", []),
-                                        budget=self.budget)
+                                        goals=goals or None, budget=self.budget)
         spec = u.spec
-        spec.success_criteria = list(dict.fromkeys([*self.mcfg.get("success_criteria", []), *spec.success_criteria]))
+        goal = self.mcfg.get("goals", {}).get(spec.goal, {}) if spec.goal else {}
+        if goal.get("target") == "all_groups":
+            if spec.target_value is not None:
+                u.problems.append(f"goal {spec.goal} counts {goal.get('unit', 'groups')}; the amount in the brief "
+                                  "is not its target")
+            spec.target_value, spec.target_unit = None, goal.get("unit", "groups")   # set from the scope at plan()
+        criteria = goal.get("success_criteria") or self.mcfg.get("success_criteria", [])
+        spec.success_criteria = list(dict.fromkeys([*criteria, *spec.success_criteria]))
         m = self.store.update(m.id, spec=spec, selection=u.selection, event="mission.understood",
                               payload={"spec": spec.model_dump(mode="json"), "selection": u.selection,
                                        "problems": u.problems})
-        self._say(f"understood: {spec.objective} | target {spec.target_value} by {spec.deadline} | "
+        self._say(f"understood: {spec.objective} | goal {spec.goal} | target {spec.target_value} by {spec.deadline} | "
                   f"selection {u.selection}" + (f" | problems {u.problems}" if u.problems else ""))
         if spec.open_questions:
             self.store.transition(m.id, S.CLARIFYING, actor="agent", reason="; ".join(spec.open_questions))
@@ -135,17 +168,32 @@ class MissionRunner:
         """Entities the mission covers: the agent's selection on top of fixed params, minus policy exclusions.
         Returns (included items, excluded [{ref, reason}], groups by id)."""
         sel = self.mcfg["selection"]
-        args = {**sel.get("fixed", {}), **self.mission.selection}
+        params = sel.get("params", {})
+        chosen = self.mission.selection
+        args = {**sel.get("fixed", {}), **{k: v for k, v in chosen.items() if params.get(k, {}).get("scope") != "group"}}
         listed = await _read(self.rt, sel["list_tool"], args, self.mission_id)
         items = listed[sel["list_key"]] if sel.get("list_key") else listed
         groups_raw = await _read(self.rt, sel["group_tool"], {}, self.mission_id)
         groups = {str(g["id"]): g for g in groups_raw}
-        rules = [(compile_guard(r["when"]), r["reason"]) for r in sel.get("exclude", [])]
+        goal = self.goal()["name"]
+        rules = [(compile_guard(r["when"]), r["reason"]) for r in sel.get("exclude", [])
+                 if not r.get("goals") or goal in r["goals"]]
         ref_field = self.cfg["prioritizer"]["fields"]["ref"]
+        value_field = self.cfg["prioritizer"]["fields"]["value"]
+        totals: dict[str, int] = {}
+        for item in items:
+            gid = str(item.get(sel["group_key"]))
+            totals[gid] = totals.get(gid, 0) + int(item.get(value_field) or 0)
+        group_rules = [(k, compile_guard(params[k]["keep"]), v) for k, v in chosen.items()
+                       if params.get(k, {}).get("scope") == "group" and params[k].get("keep")]
         included, excluded = [], []
         for item in items:
-            ctx = {"item": item, "group": groups.get(str(item.get(sel["group_key"])), {})}
+            gid = str(item.get(sel["group_key"]))
+            ctx = {"item": item, "group": groups.get(gid, {})}
             why = next((reason for guard, reason in rules if evaluate(guard, ctx).passed), None)
+            for key, keep, value in group_rules:
+                if not why and not evaluate(keep, {"group": {"total": totals[gid]}, "param": value}).passed:
+                    why = f"customer total {totals[gid]} does not meet {key} {value}"
             if why:
                 excluded.append({"ref": item[ref_field], "reason": why})
             else:
@@ -183,14 +231,25 @@ class MissionRunner:
             await load_entity(self.rt, m.id, item[self.cfg["prioritizer"]["fields"]["ref"]])
         groups = self.rank(included, await self._signals({str(i[self.mcfg["selection"]["group_key"]])
                                                            for i in included}))
+        allowed = self.approaches()
+        for g in groups:                    # the prioritizer's suggestion must be an approach this goal allows
+            if g.approach not in allowed:
+                g.approach = next(iter(allowed))
         total = sum(g.value for g in groups)
-        weights = self.mcfg.get("forecast_weights", {})
-        if_contacted = progress(m.spec.target_value, 0, {"CONTACTED": total}, weights)
+        weights = self.forecast_weights()
+        if self.counts_groups():
+            m.spec.target_value = len(groups)
+            m = self.store.update(m.id, spec=m.spec)
+            if_contacted = progress(m.spec.target_value, 0, {"CONTACTED": len(groups)}, weights)
+        else:
+            if_contacted = progress(m.spec.target_value, 0, {"CONTACTED": total}, weights)
         self._say(f"scope: {len(included)} entities in {len(groups)} groups, value {total}; "
                   f"excluded {len(excluded)}: " + ", ".join(f"{x['ref']} ({x['reason']})" for x in excluded))
-        approaches = {k: v.get("description", "") for k, v in self.mcfg["approaches"].items()}
+        approaches = {k: v.get("description", "") for k, v in allowed.items()}
+        remembered = counterparty_memory(self.rt, [g.id for g in groups])
+        rows = [{**g.as_row(), **({"memory": remembered[g.id]} if g.id in remembered else {})} for g in groups]
         try:
-            plan = await self.agent.plan(m.spec, [g.as_row() for g in groups], approaches=approaches,
+            plan = await self.agent.plan(m.spec, rows, approaches=approaches,
                                          capacity=self.mcfg.get("capacity_per_day", 5), today=self._today(),
                                          forecast={"in_scope_value": total,
                                                    "expected_if_all_contacted": if_contacted.expected},
@@ -204,7 +263,7 @@ class MissionRunner:
                          else " — the model returned no output (likely cut off by the output cap)"))
             return self.mission
         plan.expected_value = if_contacted.expected
-        if m.spec.target_value is not None and total < m.spec.target_value:
+        if not self.counts_groups() and m.spec.target_value is not None and total < m.spec.target_value:
             plan.risks.insert(0, f"target {m.spec.target_value} exceeds the whole in-scope value {total}")
         self.store.update(m.id, plan=plan, data={
             "scope": [i[self.cfg["prioritizer"]["fields"]["ref"]] for i in included], "excluded": excluded,
@@ -261,7 +320,7 @@ class MissionRunner:
         drafts: dict[str, dict[str, Any]] = {}
         feedback = self.mission.data.get("message_feedback", [])
         for batch in [b for b in plan.batches if b.start_day == 0]:
-            spec = self.mcfg["approaches"][batch.approach]
+            spec = self.approaches()[batch.approach]
             for gid in batch.groups:
                 ents = [e for e in self._open_initial(gid) if e.id not in skip]
                 if not ents:
@@ -316,15 +375,55 @@ class MissionRunner:
                                (self.mission_id,)).fetchone()
         return int(row["v"])
 
+    def reached_groups(self) -> dict[str, list[str]]:
+        """groups_reached goals: groups whose every entity has entered one of the goal's states (a guarded
+        transition, so with evidence), with the entity ids. Leaving the state later (a confirmed balance
+        that is then promised) does not undo having reached it."""
+        states = set(self.goal().get("states", []))
+        reached = {e.entity_id for e in self.rt.events.query(mission_id=self.mission_id, types=["entity.transitioned"],
+                                                             limit=100000) if e.payload.get("to") in states}
+        by: dict[str, list[Entity]] = {}
+        for e in self.rt.pipeline.list(self.mission_id):
+            by.setdefault(self._group_of(e), []).append(e)
+        return {g: [e.id for e in ents] for g, ents in by.items() if ents and all(e.id in reached for e in ents)}
+
+    def measured_value(self) -> int:
+        """Progress the goal counts: verified money, or groups that reached the goal's states."""
+        return len(self.reached_groups()) if self.counts_groups() else self.verified_value()
+
     def progress(self) -> Progress:
         open_by_state: dict[str, int] = {}
-        for e in self.rt.pipeline.list(self.mission_id):
-            if e.state in self.rt.pipeline.spec.terminal:
-                continue
-            open_by_state[e.state] = open_by_state.get(e.state, 0) + int(e.data.get("balance", e.value))
         m = self.mission
+        if self.counts_groups():
+            done = self.reached_groups()
+            order = self.rt.pipeline.spec.states
+            by: dict[str, list[Entity]] = {}
+            for e in self.rt.pipeline.list(self.mission_id):
+                by.setdefault(self._group_of(e), []).append(e)
+            for gid, ents in by.items():
+                if gid not in done:          # a group counts once, at its least advanced entity
+                    state = min((e.state for e in ents), key=lambda s: order.index(s) if s in order else 0)
+                    open_by_state[state] = open_by_state.get(state, 0) + 1
+            return progress(m.spec.target_value if m.spec else None, len(done), open_by_state, self.forecast_weights())
+        priors: dict[str, list[tuple[int, float]]] = {}
+        state_with_history = self.cfg.get("memory", {}).get("forecast_state")
+        ents = [e for e in self.rt.pipeline.list(self.mission_id) if e.state not in self.rt.pipeline.spec.terminal]
+        rates = {g: h["history"]["promise_kept_rate"] for g, h in
+                 counterparty_memory(self.rt, list({self._group_of(e) for e in ents})).items()
+                 if "promise_kept_rate" in h.get("history", {})}
+        for e in ents:
+            value = int(e.data.get("balance", e.value))
+            open_by_state[e.state] = open_by_state.get(e.state, 0) + value
+            if e.state == state_with_history and self._group_of(e) in rates:
+                priors.setdefault(e.state, []).append((value, rates[self._group_of(e)]))
         return progress(m.spec.target_value if m.spec else None, self.verified_value(), open_by_state,
-                        self.mcfg.get("forecast_weights", {}))
+                        self.forecast_weights(), priors=priors)
+
+    async def reobserve(self) -> tuple[int, Any, str]:
+        """Before COMPLETED: count only what is still there in the systems of record."""
+        if self.counts_groups():
+            return await fresh_confirmations(self.rt, self.mission_id, self.reached_groups())
+        return await fresh_verified_total(self.rt, self.mission_id)
 
     def group_rows(self) -> list[dict[str, Any]]:
         by: dict[str, list[Entity]] = {}
@@ -348,6 +447,10 @@ class MissionRunner:
                          "days_since_contact": days,
                          "first_contact_failed": gid in failed and any(e.state in self.rt.pipeline.spec.initial
                                                                        for e in ents)})
+        remembered = counterparty_memory(self.rt, list(by))
+        for r in rows:
+            if r["group"] in remembered:
+                r["memory"] = remembered[r["group"]]
         return sorted(rows, key=lambda r: -r["open_value"])
 
     def _failed_first_contacts(self) -> set[str]:
@@ -382,7 +485,7 @@ class MissionRunner:
         sent = await self.send_due_batches()
         prog = self.progress()
         if prog.target is not None and prog.verified >= prog.target:
-            fresh, ev, note = await fresh_verified_total(self.rt, m.id)
+            fresh, ev, note = await self.reobserve()
             self.rt.events.append(Event(type="verification.completed", mission_id=m.id, occurred_at=self.rt.clock.now(),
                                         payload={"subject": "mission", "ledger": prog.verified, "re_observed": fresh,
                                                  "target": prog.target, "note": note,
@@ -392,9 +495,10 @@ class MissionRunner:
                     self.rt.evidence.collect([ev], subject="mission:completed", mission_id=m.id)
                 self.store.transition(m.id, S.COMPLETED, actor="system", reason="target reached and re-verified",
                                       verified_value=fresh)
-                self._say(f"TARGET REACHED: {fresh} re-observed in the bank >= {prog.target}; mission COMPLETED")
+                self._say(f"TARGET REACHED: {fresh} re-observed >= {prog.target}; mission COMPLETED")
+                await self.learn()
                 return {"status": S.COMPLETED, "progress": prog.as_dict(), "sent": sent}
-            self._say(f"ledger says {prog.verified} but only {fresh} re-observed in the bank ({note}); not completed")
+            self._say(f"records say {prog.verified} but only {fresh} re-observed ({note}); not completed")
         decision = None
         failures = self.failures_since_review()
         today = self._today().isoformat()
@@ -410,6 +514,7 @@ class MissionRunner:
             self.store.transition(m.id, S.ESCALATED, actor="system",
                                   reason=f"deadline passed with {prog.verified} of {prog.target} verified")
             self._say("deadline passed below target: mission ESCALATED to the finance manager")
+            await self.learn()
         return {"status": self.mission.status, "progress": prog.as_dict(), "sent": sent,
                 "decision": decision.model_dump() if decision else None}
 
@@ -547,9 +652,10 @@ class MissionRunner:
         recent = m.data.get("actions", [])[-12:]
         last_seq = self.rt.events.last_seq(mission_id=m.id)
         decision = await self.agent.tick(m.spec, today=self._today(), progress=prog.as_dict(), groups=self.group_rows(),
-                                         levers=self.mcfg["levers"], recent_actions=recent,
+                                         levers=self.levers(), recent_actions=recent,
                                          recent_failures=failures or [], budget=self.budget)
         self.store.update(m.id, data={"reviewed_seq": last_seq})
+        remember_facts(self.rt, m.id)              # what happened so far, for chat and the next mission
         self._say(f"review: {decision.assessment}" + (f" | code dropped: {decision.problems}" if decision.problems else ""))
         taken = []
         for action in decision.actions:
@@ -560,6 +666,19 @@ class MissionRunner:
                           event="mission.reviewed", payload={"progress": prog.as_dict(),
                                                              "decision": decision.model_dump(), "taken": taken})
         return decision
+
+    async def learn(self) -> dict[str, Any]:
+        """Memory Writer pass: facts from this mission's events, then lessons. Never fails the mission."""
+        try:
+            out = await distill(self.rt, self.mission_id)
+        except Exception as exc:  # noqa: BLE001 - learning is best effort
+            self._say(f"memory: could not learn from this mission: {exc!r}")
+            return {"error": repr(exc)}
+        self._say(f"memory: {len(out['facts'])} fact(s), {len(out['lessons'])} lesson(s) written"
+                  + (f"; dropped: {out['problems']}" if out["problems"] else ""))
+        for item in out["lessons"]:
+            self._say(f"  learned [{item.scope}] {item.text}")
+        return out
 
     async def execute(self, lever: str, groups: list[str], rationale: str = "") -> str:
         spec = self.mcfg["levers"][lever]
@@ -602,7 +721,7 @@ class MissionRunner:
                 results.append(f"{gid}: {'sent' if out.ok else 'failed'}")
             elif lever == "retry_contact":
                 approach = self.mission.data.get("groups", {}).get(gid, {}).get("suggested_approach") \
-                    or next(iter(self.mcfg["approaches"]))
+                    or next(iter(self.approaches()))
                 results.append(f"{gid}: {await self.contact_group(gid, approach, step=f'retry:{today}')}")
             elif lever == "re_engage":
                 out = await outreach(self.rt, self.mission_id, [e.external_ref for e in ents], step="reengage1",
@@ -627,9 +746,11 @@ def plan_text(m: Mission, fmt=str) -> list[str]:
     lines = [f"Mission {m.id}  [{m.status}]", f"  brief: {m.brief}"]
     if m.spec:
         s = m.spec
-        target = fmt(s.target_value) if s.target_value is not None else "-"
+        target = "-" if s.target_value is None else (f"{s.target_value} {s.target_unit}" if s.target_unit and
+                                                         s.target_unit != "paise" else fmt(s.target_value))
         deadline = f"{s.deadline:%a %d %b %Y %H:%M}" if s.deadline else "-"
-        lines += [f"  objective: {s.objective}", f"  scope: {s.scope}", f"  target: {target}   deadline: {deadline}"]
+        lines += [f"  objective: {s.objective}", f"  goal: {s.goal or '-'}", f"  scope: {s.scope}",
+                  f"  target: {target}   deadline: {deadline}"]
         lines += [f"  success: {c}" for c in s.success_criteria]
         lines += [f"  assumption: {a}" for a in s.assumptions]
         lines += [f"  QUESTION: {q}" for q in s.open_questions]

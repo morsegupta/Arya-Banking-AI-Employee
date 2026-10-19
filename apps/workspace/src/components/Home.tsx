@@ -48,6 +48,9 @@ export default function Home({ ctx }: { ctx: Ctx }) {
 
   const p = m.progress;
   const target = p?.target ?? m.spec?.target_value ?? null;
+  // a goal that counts (e.g. customers who confirmed) instead of money
+  const unit = m.spec?.target_unit && m.spec.target_unit !== "paise" ? m.spec.target_unit : null;
+  const fmt = (v: number | null | undefined) => (unit ? (v === null || v === undefined ? "—" : String(v)) : inrShort(v));
   const pct = target ? Math.min(100, Math.round(((p?.verified ?? 0) / target) * 100)) : 0;
   const expPct = target ? Math.min(100, Math.round(((p?.expected ?? 0) / target) * 100)) : 0;
   const busy = ctx.job?.status === "running";
@@ -92,14 +95,14 @@ export default function Home({ ctx }: { ctx: Ctx }) {
       <div className="card p-6">
         <div className="flex items-end gap-6">
           <div>
-            <div className="label">Collected and verified in the bank</div>
-            <div className="mt-1 text-4xl font-semibold tabular-nums text-emerald-700">{inrShort(p?.verified ?? 0)}</div>
+            <div className="label">{unit ? `${unit} done (re-read from their own messages)` : "Collected and verified in the bank"}</div>
+            <div className="mt-1 text-4xl font-semibold tabular-nums text-emerald-700">{fmt(p?.verified ?? 0)}</div>
           </div>
-          <div className="text-muted pb-1">of {inrShort(target)} target</div>
+          <div className="text-muted pb-1">of {fmt(target)} {unit ?? "target"}</div>
           <div className="flex-1" />
           <div className="text-right text-sm">
             <div className="text-muted">Forecast by deadline</div>
-            <div className="font-semibold tabular-nums">{inrShort(p?.expected)}</div>
+            <div className="font-semibold tabular-nums">{fmt(p?.expected)}</div>
           </div>
         </div>
         <div className="mt-4 h-3 rounded-full bg-slate-100 relative overflow-hidden">
@@ -108,13 +111,14 @@ export default function Home({ ctx }: { ctx: Ctx }) {
         </div>
         <div className="mt-2 flex text-xs text-muted">
           <span>{pct}% verified</span><span className="flex-1" />
-          <span>only money matched in the bank, posted in the ERP and verified counts — never promises</span>
+          <span>{unit ? "only a quoted reply from the customer, with our exact balance, counts" :
+            "only money matched in the bank, posted in the ERP and verified counts — never promises"}</span>
         </div>
       </div>
 
       <div className="grid grid-cols-4 gap-4">
-        <Kpi label="Gap to target" value={inrShort(p?.gap)} sub={p?.expected_shortfall && p.expected_shortfall > 0
-          ? `forecast short by ${inrShort(p.expected_shortfall)}` : "forecast meets target"} />
+        <Kpi label="Gap to target" value={fmt(p?.gap)} sub={p?.expected_shortfall && p.expected_shortfall > 0
+          ? `forecast short by ${fmt(p.expected_shortfall)}` : "forecast meets target"} />
         <Kpi label="Promised" value={inrShort(counts.PROMISED?.v ?? 0)} sub={`${counts.PROMISED?.n ?? 0} invoices with a firm date`} accent="text-amber-700" />
         <Kpi label="In scope" value={inrShort(m.data.scope_value)} sub={`${board?.entities.length ?? 0} invoices · ${Object.keys(m.data.groups ?? {}).length} customers`} />
         <Kpi label="Waiting for you" value={String(ctx.status?.pending_approvals ?? 0)} sub="approvals in the inbox"

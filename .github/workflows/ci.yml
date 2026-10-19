@@ -1,0 +1,49 @@
+# CI: the generalization guarantee first (seconds), then the whole offline suite and the UI build.
+# No API key is needed: every test runs with scripted LLM decisions.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  domain-free:
+    name: runtime core is domain-free
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: domain words, layering, role-pack goals
+        run: uv run --frozen pytest -q tests/test_domain_free.py
+
+  tests:
+    name: offline test suite
+    needs: domain-free
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run playwright install --with-deps chromium
+      - run: cp .env.example .env
+      - run: uv run pytest -q
+
+  workspace:
+    name: workspace UI builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/workspace/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: apps/workspace
+      - run: npm run build
+        working-directory: apps/workspace
