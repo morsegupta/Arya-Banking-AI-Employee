@@ -1,6 +1,7 @@
 # Same company and customers as the default world; the systems misbehave all week.
 # Reliability: bank sessions expire within seconds, the CSV has renamed columns, the bank returns
-# 503s, email is down for a day, the CSV download is broken for a day. A changed ERP form
+# 503s, email is down for a day, the CSV download is broken for a day, someone keeps the AR tracker
+# open in the desktop app for a day (Arya must not overwrite it). A changed ERP form
 # (erp.layout=v2) needs a model that can adapt, so only live runs get it.
 extends: sharma_default.yaml
 world_id: sharma_chaos
@@ -9,8 +10,8 @@ chaos: { bank.session_ttl: 20, bank.csv_schema: v2 }
 chaos_by_day:
   0: { bank.transient_errors: 2 }
   1: { hub.email_outage: true }
-  2: { hub.email_outage: false, bank.csv_download: error }
-  3: { bank.csv_download: ok, bank.transient_errors: 3 }
+  2: { hub.email_outage: false, bank.csv_download: error, tracker.open_in_app: true }
+  3: { bank.csv_download: ok, bank.transient_errors: 3, tracker.open_in_app: false }
 live_only_chaos: { erp.layout: v2 }
 
 eval:

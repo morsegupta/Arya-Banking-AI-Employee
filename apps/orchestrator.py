@@ -585,6 +585,20 @@ class Orchestrator:
         if self.last_sync_ok:                   # only a bank we really read can say a claimed payment is missing
             await self.chase_unmatched_claims()
         await self.rt.scheduler.fire_due()
+        await self.sync_tracker()
+
+    async def sync_tracker(self) -> None:
+        """The team's tracker follows the pipeline; a workbook left open goes to a human once a day."""
+        from apps.tracker import sync_trackers
+        res = await sync_trackers(self.rt, self.mission_id)
+        if res["updated"]:
+            self._say(f"AR tracker updated: {', '.join(res['updated'])}")
+        if res["pending"]:
+            self._say(f"AR tracker not updated ({res['error']}); changed rows wait for the next pass")
+            if "open in the desktop app" in str(res["error"]):
+                self.escalate_failure("tracker", "The AR tracker is open in the desktop app",
+                                      {"pending": res["pending"], "error": res["error"]},
+                                      "Close the AR tracker (save your edits) so Arya can update its status columns.")
 
 
 class _Loaded:

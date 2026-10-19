@@ -33,6 +33,7 @@ from tools.browser import BrowserSessions, register_browser_tools
 from tools.channels.hub import ChannelConfig, register_channel_tools
 from tools.connectors.erp_rest import ErpConfig, register_erp_tools
 from tools.files import FileRoots, register_file_tools
+from tools.sheets import load_sheet_maps, register_sheet_tools
 from tools.vault import Vault
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +126,7 @@ def build_runtime(*, role: str = "collections", company: str = "sharma_distribut
     drive = Path(cfg["files"]["drive_root"])
     roots = FileRoots(drive if drive.is_absolute() else var / drive)
     register_file_tools(registry, roots)
+    register_sheet_tools(registry, load_sheet_maps(company_dir / "sheets"), roots.drive_root)
 
     ch = dict(cfg["channels"])
     ch["hub_url"] = _url("hub", ch["hub_url"])

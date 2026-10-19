@@ -38,6 +38,9 @@ def seed_all(world: World) -> dict:
     bank_db.seed(world)
     hub_db.seed(world)
     drive_counts = generate(world, config.drive_dir())
+    from sandbox.ar_tracker.generate import generate as tracker
+    tracker(world, config.drive_dir())
+    drive_counts["finance"] = 1
     if world.chaos:
         from sandbox import chaos
         chaos.set_switches(**world.chaos)

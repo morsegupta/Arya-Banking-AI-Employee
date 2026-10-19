@@ -1,0 +1,173 @@
+# Role Pack (sketch): vendor onboarding. Same runtime as collections, zero runtime code.
+#
+# The job: the purchase team raises new-vendor requests in the ERP; the employee collects KYC
+# documents from each vendor (PAN, GST certificate, cancelled cheque), checks the GSTIN on the
+# government GST portal, and creates the vendor master in the ERP. A vendor is ACTIVE only when the
+# portal confirms the GSTIN, the documents agree with each other, and the ERP shows the vendor
+# record: the vendor saying "all done" never counts (the same rule as "paid means money in the bank").
+#
+# Status: SKETCH. This file is complete as data and runs on the core (pipeline, guards, mission goal
+# checks, plan and review checks: tests/test_role_packs.py). Not built yet, all outside core/:
+#   - sandbox: a GST portal (web only, captcha-free test mode), an ERP vendor-master form, vendor personas
+#   - company pack: app maps gst_portal.yaml / erp_vendor.yaml, the purchase team's facts and policies
+#   - a Document Extractor config for KYC documents (PAN, GSTIN, IFSC, account name from the cheque)
+#   - prompts/ for the four agents (defaults work; role guidance makes them better)
+name: vendor_onboarding
+title: Vendor Onboarding employee
+entity: vendor_request
+value_unit: count                 # one request = 1; goals count vendors, not money
+
+pipeline:
+  states: [REQUESTED, DOCS_REQUESTED, DOCS_RECEIVED, DOCS_VERIFIED, GSTIN_VERIFIED, CREATED_IN_ERP, ACTIVE,
+           NEEDS_FIX, NO_RESPONSE, ON_HOLD, ESCALATED, REJECTED]
+  initial: [REQUESTED]
+  terminal: [ACTIVE, REJECTED]
+  constants:
+    min_confidence: 0.8
+  transitions:
+    - from: REQUESTED
+      to: DOCS_REQUESTED
+      guard: { all: [ "outreach.delivered == true", "outreach.message_id exists" ] }
+
+    # documents arrived: the reply carries attachments the extractor could read
+    - from: [DOCS_REQUESTED, NEEDS_FIX, NO_RESPONSE]
+      to: DOCS_RECEIVED
+      guard: { all: [ "classifier.intent == 'documents_sent'", "extractor.documents >= 3", "evidence.quote exists" ] }
+
+    # the documents agree with each other: same legal name, PAN inside the GSTIN, cheque name matches
+    - from: DOCS_RECEIVED
+      to: DOCS_VERIFIED
+      guard: { all: [ "extractor.pan_in_gstin == true", "extractor.names_match == true",
+                      "extractor.cheque_name_matches == true", "verifier.pass == true" ] }
+    - from: DOCS_RECEIVED
+      to: NEEDS_FIX
+      guard: "extractor.problems > 0"
+
+    # the government portal (not the vendor's PDF) says the GSTIN is active and registered to this name
+    - from: DOCS_VERIFIED
+      to: GSTIN_VERIFIED
+      guard: { all: [ "portal.gstin_status == 'Active'", "portal.legal_name_matches == true",
+                      "portal.observed_fresh == true" ] }
+    - from: DOCS_VERIFIED
+      to: NEEDS_FIX
+      guard: "portal.gstin_status != 'Active'"
+
+    # the ERP shows the vendor master with these exact details (scoped write, read back)
+    - from: GSTIN_VERIFIED
+      to: CREATED_IN_ERP
+      guard: { all: [ "erp.vendor_exists == true", "erp.details_match == true" ] }
+
+    # a person in purchase approves the first payment run to a new vendor: activation is human-only
+    - from: CREATED_IN_ERP
+      to: ACTIVE
+      actor: human
+
+    - from: DOCS_REQUESTED
+      to: NO_RESPONSE
+      actor: system
+    - from: [NEEDS_FIX, NO_RESPONSE, DOCS_VERIFIED, GSTIN_VERIFIED]
+      to: ESCALATED
+    - from: [REQUESTED, DOCS_REQUESTED, ESCALATED]
+      to: ON_HOLD
+      actor: human
+    - from: [ESCALATED, ON_HOLD]
+      to: REJECTED
+      actor: human
+
+timers:
+  - { on: DOCS_REQUESTED, at: "entered_at + 2d", do: timer.followup_due, name: followup }
+  - { on: NEEDS_FIX,      at: "entered_at + 2d", do: timer.followup_due, name: fix_followup }
+
+task_types:
+  fetch_open_items: { apps: [erp_api], goal: "List new-vendor requests that match the mission scope" }
+  verify_gstin:     { apps: [gst_portal], goal: "Look up a GSTIN on the GST portal and read its status and legal name" }
+  create_vendor:
+    apps: [erp_vendor]
+    goal: "Create the vendor master in the ERP with the verified details"
+    goal_template: >-
+      In the ERP vendor master, create vendor {legal_name}: GSTIN {gstin}, PAN {pan}, IFSC {ifsc},
+      payment terms {terms} days, and the bank account from the verified cheque (filled in by code,
+      never typed by the model). Submit once.
+
+entity_source:
+  detail_tool: erp.get_vendor_request
+  detail_arg: number
+  external_ref: number
+  value: one                      # every request counts 1
+  facts: [number, vendor_name, requested_by, category, expected_spend_paise, status]
+  documents: []
+  counterparty:
+    tool: erp.get_vendor_contact
+    arg: number
+    from_fact: number
+    name: contact_name
+    email: contact_email
+    whatsapp: contact_whatsapp
+
+outreach:
+  purpose: "Welcome the new vendor and ask for the KYC documents: PAN, GST certificate, cancelled cheque."
+  channel_order: [email, whatsapp]
+  max_follow_ups: 2
+  purposes:
+    follow_up: "Follow-up: we are still waiting for the KYC documents listed. Ask politely, once."
+    fix_request: "Some documents do not match (listed in the facts). Ask for corrected copies, naming each problem."
+
+reply_classifier:
+  intents:
+    documents_sent: "sends one or more of the requested documents"
+    question: "asks a question about the onboarding or the documents"
+    bank_detail_change: "asks to change bank details after sending them, or sends a second, different account"
+    not_now: "acknowledges without sending anything"
+    declines: "does not want to become a vendor"
+    unclear: "none of the above, or cannot tell"
+  moves:
+    question: []
+    declines: []
+
+mission:
+  selection:
+    list_tool: erp.list_vendor_requests
+    list_key: requests
+    fixed: { status: "NEW" }
+    params:
+      category: { type: string, description: "Only requests in this purchase category" }
+      requested_by: { type: string, description: "Only requests raised by this person or team" }
+    group_tool: erp.list_vendor_contacts
+    group_key: number             # one vendor per request
+    exclude:
+      - { when: "group.blacklisted == true", reason: "vendor is on the company's do-not-onboard list" }
+  goals:
+    onboard:
+      description: "Onboard the new vendors: documents collected and checked, GSTIN verified on the portal, vendor created in the ERP."
+      measure: groups_reached
+      states: [CREATED_IN_ERP, ACTIVE]
+      target: all_groups
+      unit: vendors
+      success_criteria:
+        - "Every vendor in scope exists in the ERP with details the GST portal and the documents agree on"
+      approaches: [standard_kyc]
+      levers: [follow_up, escalate]
+  capacity_per_day: 10
+  minor_units: 100
+  token_budget: 300000
+  forecast_weights: { REQUESTED: 0.5, DOCS_REQUESTED: 0.5, DOCS_RECEIVED: 0.7, DOCS_VERIFIED: 0.85,
+                      GSTIN_VERIFIED: 0.95, CREATED_IN_ERP: 1.0, NEEDS_FIX: 0.4, NO_RESPONSE: 0.15 }
+  approaches:
+    standard_kyc:
+      description: "Welcome message with the document checklist."
+      purpose: "Welcome the new vendor and ask for the KYC documents: PAN, GST certificate, cancelled cheque."
+      documents: []
+  max_replans_per_day: 2
+  levers:
+    follow_up:
+      description: "Remind a vendor who has not sent the documents."
+      states: [DOCS_REQUESTED, NEEDS_FIX]
+      min_days_since_contact: 2
+    escalate:
+      description: "Hand the vendor to the purchase team with what was found."
+      states: [NEEDS_FIX, NO_RESPONSE, DOCS_VERIFIED, GSTIN_VERIFIED]
+
+prioritizer:
+  fields: { ref: number, group: number, group_name: vendor_name, value: expected_spend_paise, age: days_waiting }
+  weights: { value: 0.6, age: 0.4, risk: 0.0 }
+  default_approach: standard_kyc

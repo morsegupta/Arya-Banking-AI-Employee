@@ -9,7 +9,7 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 3 midday complete** (built and evaluated offline; live LLM check and live evals pending a working key). A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 3 afternoon complete** (built and evaluated offline; live LLM check and live evals pending a working key). A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
 covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
 that commits the company waits in an approvals inbox; text that tries to instruct the AI is
@@ -29,8 +29,51 @@ quarantined before any agent reads it; and models never see account numbers, ema
 | Day 2 evening | Workspace UI + API: Home (verified vs target), invoice board, per-invoice timeline / conversation / evidence, approvals inbox, mission chat, live activity; Scenario 1 runs from the browser |
 | Day 3 morning | Scenarios 2, 3, 5, 6; mission **goals** in the role pack (a second kind of brief with no code for it); Memory Writer + memory retrieval (customer history, channel choice, learned Operator playbooks, forecast priors); CI with the domain-word check; one-command live LLM check |
 | Day 3 midday | **Eval harness** over five seeded worlds (default, chaos, adversarial, on-time payers, statements brief), scored against hidden ground truth; run-over-run learning; fixes for what it found; evals in CI |
+| Day 3 afternoon | **AR tracker** (the finance team's desktop spreadsheet) kept in sync through the file route; **second role pack** (`vendor_onboarding`, sketch) running on the unchanged core. Vision driver deliberately skipped (below) |
 
-Next: Day 3 afternoon — stretch items (only if green).
+Next: Day 3 evening — README polish and the demo video.
+
+## The AR tracker and the second role pack (Day 3 afternoon)
+
+**AR tracker.** The finance team's own workbook (`var/drive/finance/ar_tracker.xlsx`, one row per
+invoice, with the team's Owner and Notes columns) is a desktop app's file. After every pass Arya
+updates the rows whose state, balance or promised date changed: status in the team's own words,
+balance, promised date, a one-line last action written by code (never a customer's words), a stamp.
+
+| Control | Where |
+|---|---|
+| Sheet map (company pack): path, worksheet, key column, **writable columns**, the team's status words | [sheets/ar_tracker.yaml](packs/companies/sharma_distributors/sheets/ar_tracker.yaml) |
+| Only writable columns can be written (others refused); saved atomically; every write read back (`verified`) and kept as evidence | [tools/sheets.py](tools/sheets.py) |
+| **Open on someone's desktop** (LibreOffice/Excel lock file): nothing written, rows wait for the next pass, a human is asked once a day to close it (chaos switch `tracker.open_in_app`) | [apps/tracker.py](apps/tracker.py) |
+| Evals: the tracker shows every invoice's current status; the team's columns never change; rows outside the mission untouched | `evals/harness.py` |
+
+**Why no vision driver.** The architecture's optional desktop route (§7 row 10) drives the open app on
+screen with a vision model (UI-TARS / Qwen2.5-VL). gpt-oss-120b reads text only, so that route needs a
+second model family, a virtual display in Docker and a screenshot→action loop: the riskiest stretch item
+and first on the cut line (§14). The file route covers the job; the one case it cannot (the workbook is
+open and must be edited live) is exactly where the ladder hands over to a person.
+
+**Second role pack: `vendor_onboarding` (sketch).** [packs/roles/vendor_onboarding/role.yaml](packs/roles/vendor_onboarding/role.yaml):
+collect KYC documents from new vendors, verify the GSTIN on the government portal, create the vendor in
+the ERP; activation is human-only. Its pipeline, guards, goal (`onboard`, counted in vendors), selection,
+approach and levers are data; [tests/test_role_packs.py](tests/test_role_packs.py) runs it on the
+unchanged core: guards decide ("the vendor says it is done" never creates or activates a vendor; an
+inactive GSTIN never verifies), and the Mission Agent's checks accept its goal, selection, plan and
+levers (collections levers do not exist there). Not built: its sandbox (GST portal, ERP vendor form,
+vendor personas), app maps, a KYC Document Extractor config and prompts.
+
+## What to build next
+
+1. **ERP connector as an MCP server**: expose the read API (and later scoped writes) through the MCP SDK
+   so any MCP-capable runtime can use it; the registry would load MCP tools like built-in ones.
+2. **Embedded mode** (`company.yaml mode: embedded`): Arya works beside human collectors in the same ERP,
+   skips accounts a person has claimed, and leaves a note on every action instead of owning the account.
+3. Live evals with the real models (`evals.run_evals --live`), then per-tenant eval suites gating prompt
+   and model changes in CI.
+4. The vendor-onboarding sandbox and tools, so the second pack runs end to end.
+5. Real connectors (Tally / Zoho Books / SAP B1, bank APIs or account aggregators) and real channels
+   (WhatsApp Business API, a voice agent for follow-up calls).
+6. Optional vision driver for desktop apps that have no file route, with an open-weights GUI model.
 
 ## Evals (Day 3 midday)
 
@@ -395,13 +438,14 @@ The sandbox clock is simulated: days pass in seconds. Every step is an event in 
 core/            role-agnostic runtime: models, events, scheduler, pipeline, mission, guards, LLM client
 agents/          primary agents: Mission, Operator, Conversation (domain-free)
 subagents/       Prioritizer, Reply Classifier, Matcher, Document Generator (domain-free)
-tools/           tool registry, browser driver, channels, files, ERP connector, vault, app maps
+tools/           tool registry, browser driver, channels, files, spreadsheets, ERP connector, vault, app maps
 apps/            runtime wiring, flows, settlement, orchestrator, mission runner, documents, CLI, workspace API
 apps/workspace/  workspace UI (React + Vite + Tailwind)
 packs/roles/collections/            the job: pipeline, guards, timers, task types, prompts
-packs/companies/sharma_distributors/ the company: app maps, channels, facts it may state
+packs/roles/vendor_onboarding/      a second job (sketch): pipeline, guards, goal, levers
+packs/companies/sharma_distributors/ the company: app maps, sheet maps, channels, facts it may state
 sandbox/         the fake company: ERP, bank portal, message hub, drive, customer simulator
-evals/worlds/    seeded worlds with hidden ground truth
+evals/           eval harness, scripted stand-in for the models, seeded worlds with hidden ground truth
 config/          model per role
 tests/           unit, integration, live-browser and end-to-end tests
 ```
@@ -476,7 +520,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-301 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+306 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -491,7 +535,9 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 3).** A second role pack.
+- **No vision (computer-use) driver.** Desktop apps are operated through their files; a workbook open
+  on someone's desktop waits for a person (see above).
+- The second role pack is a sketch: it runs on the core in tests, not end to end (no sandbox for it).
 - **Offline evals measure the runtime, not the models.** `evals/scripted.py` answers for the models
   deterministically; `--live` has not been run (no working key yet). Live numbers will be lower.
 - **Day 3 morning was built without a live key.** The offline suite covers the code around the models;

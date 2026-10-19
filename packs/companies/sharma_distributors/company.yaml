@@ -17,6 +17,10 @@ policy_docs: [policies/credit_policy.md]
 
 timezone: Asia/Kolkata
 
+# The team's own spreadsheets Arya keeps in sync with the pipeline (sheet maps in sheets/).
+trackers:
+  - { sheet: ar_tracker }
+
 connectors:
   erp_api:
     base_url: http://127.0.0.1:8101

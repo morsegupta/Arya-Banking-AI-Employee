@@ -308,6 +308,21 @@ def score(world: World, rt, runner: MissionRunner, var: Path, *, snapshots: list
     missed_promises = sorted(promised_customers - captured)
     check("no promise recorded that the customer did not make", not invented, invented)
 
+    # --- the team's own tracker: follows the pipeline, people's columns untouched -------------------
+    tracker = _tracker_rows(var)
+    if tracker is not None:
+        from sandbox.ar_tracker.generate import NOTES
+        from tools.sheets import load_sheet_maps
+        words = load_sheet_maps(rt.company_dir / "sheets")["ar_tracker"].values.get("status", {})
+        stale = sorted(r for r, s in state.items() if tracker.get(r, {}).get("Status") != words.get(s, s))
+        check("AR tracker shows every invoice's current status", not stale,
+              {r: [tracker.get(r, {}).get("Status"), state[r]] for r in stale})
+        touched = sorted(r for r, row in tracker.items()
+                         if (row.get("Owner"), row.get("Notes")) != NOTES.get(r, ("Kavya", None)))
+        check("AR tracker: the team's own columns never written", not touched, touched)
+        outside = sorted(r for r, row in tracker.items() if r not in state and row.get("Updated"))
+        check("AR tracker: rows outside the mission untouched", not outside, outside)
+
     expect = world.eval.get("expect", {})
     if "status" in expect:
         check(f"mission ends {expect['status']}", m.status in expect["status"].split("|"), m.status)
@@ -338,6 +353,20 @@ def score(world: World, rt, runner: MissionRunner, var: Path, *, snapshots: list
         "checks": checks, "passed": all(c["passed"] for c in checks),
         "memory": len(rt.memory.list()) if rt.memory else 0,
     }
+
+
+def _tracker_rows(var: Path) -> dict[str, dict[str, Any]] | None:
+    path = var / "drive" / "finance" / "ar_tracker.xlsx"
+    if not path.exists():
+        return None
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True)
+    try:
+        rows = list(wb["Receivables"].iter_rows(values_only=True))
+    finally:
+        wb.close()
+    header = list(rows[0])
+    return {r[0]: dict(zip(header, r)) for r in rows[1:]}
 
 
 def _quiet(t: datetime, start: str, end: str, weekdays_only: bool) -> bool:

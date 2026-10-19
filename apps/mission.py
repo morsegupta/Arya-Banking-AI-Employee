@@ -483,6 +483,9 @@ class MissionRunner:
         self.log += self.orch.log
         self.orch.log.clear()
         sent = await self.send_due_batches()
+        await self.orch.sync_tracker()              # the batches just sent show in the team's tracker
+        self.log += self.orch.log
+        self.orch.log.clear()
         prog = self.progress()
         if prog.target is not None and prog.verified >= prog.target:
             fresh, ev, note = await self.reobserve()

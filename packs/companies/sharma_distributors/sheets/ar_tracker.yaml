@@ -1,0 +1,27 @@
+# The AR team's own tracker: a desktop spreadsheet on the shared drive (architecture §9).
+# Arya keeps its status columns in sync with what it verified; people's columns are never written.
+name: ar_tracker
+title: AR tracker (finance team spreadsheet)
+path: finance/ar_tracker.xlsx
+worksheet: Receivables
+key: Invoice
+writable: ["Status", "Balance (₹)", "Promised on", "Last action", "Updated"]
+numeric: ["Balance (₹)"]
+lock_files: [".~lock.{file}#", "~${file}"]      # LibreOffice / Excel: the file is open on someone's desktop
+notes:
+  - "Owner and Notes are the finance team's columns: read them, never write them."
+values:
+  # pipeline state -> the team's own status words
+  status:
+    OVERDUE: Overdue
+    CONTACTED: Reminder sent
+    ACKNOWLEDGED: Customer replied
+    CONFIRMED: Balance confirmed
+    PROMISED: Promised
+    PARTIALLY_PAID: Part paid
+    PAID: Paid
+    BROKEN_PROMISE: Promise missed
+    DISPUTED: Disputed
+    NO_RESPONSE: No response
+    ESCALATED: With team
+    WRITTEN_OFF: Written off
