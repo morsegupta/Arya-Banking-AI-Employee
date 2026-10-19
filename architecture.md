@@ -632,39 +632,7 @@ Agent code, the tool interface, the pack formats and the event schema stay the s
 
 ---
 
-## 14. 3-day build plan
-
-Rule: **end every day with something that runs end to end.** Thin vertical slice first, then depth.
-
-### Day 1 — Sandbox company + one invoice end to end
-| Block | Deliverable |
-|---|---|
-| Morning | Repo + docker compose. **Mini ERP**, **bank portal**, **message hub**, drive with invoice PDFs; seed 15 customers / 25 invoices. |
-| Midday | `models.py`, tool registry (retry, idempotency, risk tiers), Playwright driver with accessibility snapshots, channel adapters, file tools. Event store + scheduler. |
-| Afternoon | Pipeline engine reading `role.yaml` + guard evaluator. **Operator** pulls invoices from ERP and downloads the bank statement; **Conversation Agent** emails one customer; **customer simulator + payment engine** replies and pays. |
-| Evening | One invoice goes OVERDUE → CONTACTED → PROMISED → PAID (matched + receipt posted) from the CLI. |
-
-### Day 2 — Mission brain, trust and the workspace
-| Block | Deliverable |
-|---|---|
-| Morning | **Mission Agent** (brief → spec + prioritised plan, ticks, forecast, spawns batches). Prioritizer, Reconciliation Matcher (multi-invoice + partial), Reply Classifier, Document Generator. |
-| Midday | **Verifier** + Evidence Collector. **Policy Gate** + `policies.yaml` + **Approval Broker**. Vault, PII tokenization, **Injection Guard (Prompt Guard 2 86M, chunked, quarantine path)**, untrusted-content wrapping, read-only bank map. |
-| Afternoon | Reliability: retries, fallbacks (email → WhatsApp, CSV → on-screen table, DOM → CUA), replan, loop detection, budgets, resume after kill. Chaos flags. |
-| Evening | **Workspace UI**: Home (verified vs target), invoice board by stage, per-invoice timeline with evidence, Approvals inbox, Mission chat. Scenario 1 runs from the UI. |
-
-### Day 3 — Generalize, measure, polish
-| Block | Deliverable |
-|---|---|
-| Morning | Scenarios 2, 3, 5 and 6 (different brief, zero code changes). Memory Writer + playbook retrieval. CI domain-word check on `core/`. |
-| Midday | Eval harness over 3–4 seeded worlds incl. chaos, fraud and injection; record metrics; fix the top failures. |
-| Afternoon | Stretch (only if green): AR tracker via the optional vision driver (UI-TARS/Qwen2.5-VL) on LibreOffice; `vendor_onboarding` pack; ERP MCP server; `embedded` mode. |
-| Evening | README (setup, run, architecture, decisions, limitations, assumptions, next steps, models/libs). Demo video: brief → board filling → approval → "already paid" handled honestly → chaos recovery → fraud/injection blocked → second brief → eval table. |
-
-**Cut line if behind:** drop in this order — desktop/CUA demo, second role pack, MCP wrapper, memory learning, call channel. **Never cut**: pipeline guards, Reconciliation Matcher, Verifier, Policy Gate, approvals, recovery, customer simulators with payment engine.
-
----
-
-## 15. Known limitations (state openly in the README)
+## 14. Known limitations (state openly in the README)
 
 - Sandbox only: real bank portals have MFA, device binding and strict terms; production should prefer bank APIs / account aggregators.
 - Calls are simulated as transcripts; no real voice pipeline.
@@ -676,7 +644,7 @@ Rule: **end every day with something that runs end to end.** Thin vertical slice
 - Single-node runtime; timers durable but not distributed.
 - Learning is retrieval of playbooks, not model training.
 
-## 16. What to build next
+## 15. What to build next
 
 1. Real connectors: Tally / Zoho Books / SAP B1 via MCP; bank APIs or account aggregator for statements.
 2. Real channels: WhatsApp Business API and a voice agent for follow-up calls.
