@@ -30,7 +30,7 @@ from apps.flows import role_cfg, role_prompt
 from apps.runtime import Runtime
 from core.llm import LLMError
 from core.memory import MemoryItem
-from subagents.memory_writer import MemoryWriter
+from subagents.memory_writer import MemoryWriter, near_duplicate
 
 
 def _cfg(rt: Runtime) -> dict[str, Any]:
@@ -247,8 +247,15 @@ async def distill(rt: Runtime, mission_id: str) -> dict[str, Any]:
                                                  budget=rt.budget(mission_id, 20_000))
     except LLMError as exc:
         return {"facts": facts, "lessons": [], "problems": [f"memory writer failed: {exc}"]}
+    rejected = {}
+    for m in rt.memory.list(statuses=("rejected",)):
+        if m.kind == "lesson":
+            rejected.setdefault(m.scope, []).append(m.text)
     written = []
     for lesson in lessons:
+        if any(near_duplicate(lesson.text, r) for r in rejected.get(lesson.scope, [])):
+            problems.append(f"a human rejected this lesson before (reworded): {lesson.text[:60]!r} dropped")
+            continue
         screening = await rt.guard.screen(lesson.text) if rt.guard else None
         if screening is not None and screening.flagged:
             problems.append(f"lesson looked like an instruction (score {screening.score:.2f}): dropped")

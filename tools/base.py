@@ -7,7 +7,8 @@ Every tool call goes through ToolRegistry.invoke, which enforces, in order:
      tool is NOT run again (a replay changes nothing, so it needs no policy decision)
   4. the Policy Gate allows it (core.policy; `ask` holds the call for a human, `defer` means not now);
      non-idempotent tools need a key
-  5. L0 retry with exponential backoff + jitter, for transient errors only
+  5. L0 retry with exponential backoff + jitter, for transient errors only, and only for calls that are
+     idempotent or deduped by the remote system (a timed-out send may have gone out)
   6. the tool's own verify() check
   7. secret scrubbing, then an event for the audit trail
 
@@ -75,6 +76,9 @@ class RunContext:
     artifacts_dir: Path = field(default_factory=lambda: Path("var/runtime/artifacts"))
     # writes this task may make on apps with scoped writes: {app: [{"method", "path", "form": {field: value}}]}
     write_scope: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # documents an outgoing message may carry besides this task's own files (paths as the drive tools
+    # name them); None = only the task's own files. Keeps one counterparty's documents from reaching another.
+    attachable: list[str] | None = None
 
     def task_dir(self) -> Path:
         path = self.artifacts_dir / (self.task_id or "adhoc")
@@ -214,6 +218,13 @@ class ToolRegistry:
                 return prior
 
         result = await self._run_with_retry(tool, args, ctx)
+        if not tool.idempotent and not tool.dedupes_downstream and result.error_kind == "transient":
+            # A timeout or 5xx after a send/submit may have happened anyway; the remote side cannot dedupe,
+            # so neither repeat it now nor let a later call repeat it blindly (same as a crash mid-call).
+            result = result.model_copy(update={"error_kind": "permanent", "error": (
+                f"outcome unknown after a transient error ({result.error}); reconcile before retrying")})
+            self._record(tool, ctx, result)
+            return result
         if result.ok:
             try:
                 result.verified = await tool.verify(args, result, ctx)
@@ -230,8 +241,10 @@ class ToolRegistry:
         return result
 
     async def _run_with_retry(self, tool: Tool, args: BaseModel, ctx: RunContext) -> ToolResult:
+        """L0 retry. A side effect the remote system cannot dedupe gets one attempt only."""
         last: ToolResult | None = None
-        for attempt in range(1, self.max_attempts + 1):
+        attempts = self.max_attempts if tool.idempotent or tool.dedupes_downstream else 1
+        for attempt in range(1, attempts + 1):
             try:
                 result = await asyncio.wait_for(tool.run(args, ctx), timeout=tool.timeout_seconds)
                 result.attempts = attempt
@@ -239,7 +252,7 @@ class ToolRegistry:
             except (TransientToolError, TimeoutError) as exc:
                 last = ToolResult(ok=False, error=str(exc) or type(exc).__name__, error_kind="transient",
                                   attempts=attempt)
-                if attempt < self.max_attempts:
+                if attempt < attempts:
                     delay = self.backoff_base * 2 ** (attempt - 1)
                     await self._sleep(delay + random.uniform(0, delay / 2))
             except ToolError as exc:

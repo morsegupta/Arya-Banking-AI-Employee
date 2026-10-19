@@ -51,6 +51,23 @@ def _norm(text: str) -> str:
     return re.sub(r"\W+", " ", text).strip().lower()
 
 
+_FILLER = {"a", "an", "the", "of", "to", "in", "on", "at", "by", "for", "and", "or", "is", "are", "was", "were",
+           "it", "its", "they", "their", "this", "that", "with", "usually", "always", "often", "tends"}
+
+
+def _stems(text: str) -> set[str]:
+    words = [w for w in _norm(text).split() if w not in _FILLER]
+    return {re.sub(r"(ing|ed|es|s|d)$", "", w) if len(w) > 4 else w for w in words}
+
+
+def near_duplicate(a: str, b: str, threshold: float = 0.75) -> bool:
+    """Same lesson in other words: most content words of the shorter one appear in the other."""
+    x, y = _stems(a), _stems(b)
+    if min(len(x), len(y)) < 3:
+        return _norm(a) == _norm(b)
+    return len(x & y) / min(len(x), len(y)) >= threshold
+
+
 class MemoryWriter:
     def __init__(self, llm: LLMClient, *, role_prompt: str = ""):
         self.llm, self.role_prompt = llm, role_prompt

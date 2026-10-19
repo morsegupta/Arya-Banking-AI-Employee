@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
 from pathlib import Path
@@ -170,9 +171,12 @@ class Pipeline:
         return [to for (f, to) in self._guards if f == state]
 
     def propose(self, entity_id: str, to_state: str, context: dict[str, Any], *, actor: Actor = "agent",
-                facts: dict[str, Any] | None = None) -> TransitionResult:
+                facts: dict[str, Any] | None = None, data: dict[str, Any] | None = None,
+                also: Callable[[sqlite3.Connection], None] | None = None) -> TransitionResult:
         """Try to move an entity. `context` holds the evidence namespaces the guard reads
-        (e.g. classifier, matcher, verifier, evidence); `facts` are merged into entity data on success."""
+        (e.g. classifier, matcher, verifier, evidence); `facts` are merged into entity data on success.
+        On success, `data` is merged into the entity's data and `also` runs on the same connection, so the
+        move, the data change and the caller's own bookkeeping commit together or not at all."""
         now = self.clock.now()
         with self.db.transaction() as conn:
             row = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
@@ -204,9 +208,11 @@ class Pipeline:
             if not guard.passed:
                 return refuse("guard failed", guard)
 
-            data = {**entity.data, "facts": merged_facts}
+            new_data = {**entity.data, **(data or {}), "facts": merged_facts}
             conn.execute("UPDATE entities SET state = ?, data_json = ?, entered_at = ?, version = version + 1 "
-                         "WHERE id = ?", (to_state, json.dumps(data, default=str), now.isoformat(), entity.id))
+                         "WHERE id = ?", (to_state, json.dumps(new_data, default=str), now.isoformat(), entity.id))
+            if also is not None:
+                also(conn)
             self.events.append_in(conn, Event(
                 type="entity.transitioned", mission_id=entity.mission_id, entity_id=entity.id, occurred_at=now,
                 payload={"from": current, "to": to_state, "actor": actor, "facts": facts or {},

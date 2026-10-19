@@ -100,6 +100,18 @@ class EventStore:
         with self.db.read() as conn:
             return [_row_to_event(r) for r in conn.execute(sql + " ORDER BY seq LIMIT ?", [*args, limit])]
 
+    def latest(self, limit: int, *, mission_id: str | None = None, since_seq: int = 0,
+               exclude_prefix: str | None = None) -> list[Event]:
+        """The newest `limit` events (oldest first), optionally leaving out one type prefix (e.g. "tool.")."""
+        sql, args = "SELECT * FROM events WHERE seq > ?", [since_seq]
+        if mission_id is not None:
+            sql, args = sql + " AND mission_id = ?", [*args, mission_id]
+        if exclude_prefix:
+            sql, args = sql + " AND substr(type, 1, ?) != ?", [*args, len(exclude_prefix), exclude_prefix]
+        with self.db.read() as conn:
+            rows = conn.execute(sql + " ORDER BY seq DESC LIMIT ?", [*args, limit]).fetchall()
+        return [_row_to_event(r) for r in reversed(rows)]
+
     def last_seq(self, *, mission_id: str | None = None) -> int:
         sql, args = "SELECT COALESCE(MAX(seq), 0) AS s FROM events", []
         if mission_id is not None:

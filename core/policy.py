@@ -172,7 +172,8 @@ class PolicyGate:
             payload={"tool": tool.name, "app": tool.app, "args": args, "reason": reason, "rule": rule,
                      "context": {"mission_id": ctx.mission_id, "task_id": ctx.task_id, "entity_id": ctx.entity_id,
                                  "idempotency_key": ctx.idempotency_key,
-                                 "counterparty": getattr(ctx, "counterparty", None)}})
+                                 "counterparty": getattr(ctx, "counterparty", None),
+                                 "attachable": getattr(ctx, "attachable", None)}})
         return PolicyDecision("ask", f"{reason}; waiting for approval {a.id}", rule, approval_id=a.id)
 
     def next_allowed(self, now: datetime, comm: dict[str, Any]) -> datetime | None:

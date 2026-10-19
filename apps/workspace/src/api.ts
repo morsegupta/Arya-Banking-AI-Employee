@@ -61,7 +61,8 @@ export type MemoryItem = {
 export type ChatTurn = { at: string; by: string; question: string; answer: string; refs: string[]; groups: string[]; confidence: number };
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...init });
+  // X-Arya-Workspace: the API refuses actions without it, so other sites can't drive it via this browser
+  const res = await fetch(path, { headers: { "Content-Type": "application/json", "X-Arya-Workspace": "1" }, ...init });
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail ?? detail; } catch { /* not json */ }

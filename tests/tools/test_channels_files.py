@@ -96,7 +96,8 @@ def test_channel_scope_is_per_channel(tools, ctx):
 
 def test_inbox_thread_and_attachment(tools, ctx, hub_transport, sandbox_var):
     sent = run(tools.invoke("email.send", {"to": GLOBEX, "subject": "INV-2291", "body": "Copy attached",
-                                          "attachments": ["invoices/INV-2291.pdf"]}, ctx(ALL, key="k")))
+                                          "attachments": ["invoices/INV-2291.pdf"]},
+                           ctx(ALL, key="k", attachable=["invoices/INV-2291.pdf"])))
     assert sent.output["attachments"][0]["filename"] == "INV-2291.pdf"
 
     async def customer_reply():
@@ -121,6 +122,18 @@ def test_attachment_paths_confined(tools, ctx):
     res = run(tools.invoke("email.send", {"to": GLOBEX, "body": "x", "attachments": ["../erp.db"]},
                            ctx(ALL, key="k")))
     assert res.error_kind == "denied" and "outside" in res.error
+
+
+def test_only_documents_offered_for_this_message_can_be_attached(tools, ctx):
+    """Another customer's invoice or the internal credit policy never leaves with a message."""
+    offered = ["invoices/INV-2291.pdf"]
+    for other in ("invoices/INV-2240.pdf", "contracts/C02_supply_agreement.pdf"):
+        res = run(tools.invoke("email.send", {"to": GLOBEX, "body": "x", "attachments": [other]},
+                               ctx(ALL, key=f"k-{other}", attachable=offered)))
+        assert res.error_kind == "denied" and "not offered" in res.error, other
+    res = run(tools.invoke("email.send", {"to": GLOBEX, "body": "x", "attachments": offered},
+                           ctx(ALL, key="k-own")))
+    assert res.error_kind == "denied", "nothing offered: only the task's own files may go out"
 
 
 def test_call_request_and_status(tools, ctx):
@@ -178,3 +191,8 @@ def test_read_csv_and_xlsx_from_task_dir(tools, ctx):
 
 def test_missing_file_is_permanent(tools, ctx):
     assert run(tools.invoke("files.read_pdf", {"path": "invoices/NOPE.pdf"}, ctx(ALL))).error_kind == "permanent"
+
+
+def test_attachment_message_id_is_an_id_not_a_path(tools, ctx):
+    res = run(tools.invoke("email.attachment", {"message_id": "../../packs", "filename": "role.yaml"}, ctx(ALL)))
+    assert res.error_kind == "invalid_args"

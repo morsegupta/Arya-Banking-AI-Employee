@@ -1,0 +1,20 @@
+# Never build secrets or local state into the image: .env holds the real Groq key, var/ holds the
+# sandbox databases (customer data) and the runtime's audit log.
+.env
+.env.*
+!.env.example
+var/
+evals/results/
+
+.git/
+.github/
+.claude/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.DS_Store
+*.pdf
+
+apps/workspace/node_modules/
+apps/workspace/dist/

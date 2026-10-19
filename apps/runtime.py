@@ -158,7 +158,7 @@ def build_runtime(*, role: str = "collections", company: str = "sharma_distribut
         p, c = a.payload, a.payload["context"]
         ctx = RunContext(mission_id=c.get("mission_id"), task_id=c.get("task_id"), entity_id=c.get("entity_id"),
                          allowed_apps={p["app"]}, idempotency_key=c.get("idempotency_key"), artifacts_dir=artifacts,
-                         counterparty=c.get("counterparty"))
+                         counterparty=c.get("counterparty"), attachable=c.get("attachable"))
         res = await registry.invoke(p["tool"], p["args"], ctx)
         return {"ok": res.ok, "output": res.output, "error": res.error}
     approvals.register_executor("tool_call", run_held_call)

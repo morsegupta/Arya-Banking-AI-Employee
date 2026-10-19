@@ -127,7 +127,7 @@ def test_key_reuse_with_different_args_is_refused(registry, ctx):
 
 
 def test_transient_retry_with_backoff(registry, ctx, sleeps):
-    send = Send(fail_times=2)
+    send = Send(fail_times=2, downstream=True)
     registry.register(send)
     res = run(registry.invoke("demo.send", {"text": "x"}, ctx({"demo"}, key="k")))
     assert res.ok and res.attempts == 3 and send.calls == 3
@@ -135,13 +135,24 @@ def test_transient_retry_with_backoff(registry, ctx, sleeps):
 
 
 def test_transient_gives_up_after_budget(registry, ctx, sleeps):
-    send = Send(fail_times=10)
+    send = Send(fail_times=10, downstream=True)
     registry.register(send)
     res = run(registry.invoke("demo.send", {"text": "x"}, ctx({"demo"}, key="k")))
     assert not res.ok and res.error_kind == "transient" and res.attempts == 3 and send.calls == 3
     # A failed call may be retried later with the same key.
     send.fail_times = 0
     assert run(registry.invoke("demo.send", {"text": "x"}, ctx({"demo"}, key="k"))).ok
+
+
+def test_send_the_remote_cannot_dedupe_is_never_repeated_after_a_transient_error(registry, ctx, sleeps):
+    """A timeout may mean the message went out: one attempt, and the key stays blocked until reconciled."""
+    send = Send(fail_times=1)
+    registry.register(send)
+    res = run(registry.invoke("demo.send", {"text": "x"}, ctx({"demo"}, key="k")))
+    assert not res.ok and res.error_kind == "permanent" and "outcome unknown" in res.error
+    assert send.calls == 1 and sleeps == []
+    again = run(registry.invoke("demo.send", {"text": "x"}, ctx({"demo"}, key="k")))
+    assert not again.ok and "unknown outcome" in again.error and send.calls == 1
 
 
 def test_permanent_error_not_retried(registry, ctx, sleeps):

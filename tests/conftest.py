@@ -74,9 +74,9 @@ def registry(runtime_db, events, sleeps):
 def ctx(tmp_path):
     from tools.base import RunContext
 
-    def make(apps, key=None, task_id="tsk_test"):
+    def make(apps, key=None, task_id="tsk_test", attachable=None):
         return RunContext(mission_id="mis_test", task_id=task_id, allowed_apps=set(apps),
-                          idempotency_key=key, artifacts_dir=tmp_path / "artifacts")
+                          idempotency_key=key, artifacts_dir=tmp_path / "artifacts", attachable=attachable)
     return make
 
 

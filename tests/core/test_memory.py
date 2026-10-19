@@ -59,3 +59,11 @@ def test_forecast_uses_a_remembered_promise_kept_rate():
     # 400 of the promised value belongs to a customer who kept 1 promise in 4
     remembered = progress(1000, 0, {"PROMISED": 600, "CONTACTED": 200}, weights, priors={"PROMISED": [(400, 0.25)]})
     assert remembered.expected == int(200 * 0.8 + 400 * 0.25) + 100
+
+
+def test_a_rejected_lesson_reworded_is_still_recognised():
+    from subagents.memory_writer import near_duplicate
+    rejected = "Pays three days after the promised date."
+    assert near_duplicate("Usually pays three days after the promise date.", rejected)
+    assert not near_duplicate("Email bounces; WhatsApp reaches them.", rejected)
+    assert not near_duplicate("Pays on Fridays.", "Pays on Mondays.")

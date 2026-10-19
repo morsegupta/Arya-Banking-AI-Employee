@@ -85,3 +85,13 @@ def test_bus_prefix_subscribers_and_isolation(events):
     assert seen == [("task", "task.started"), ("all", "task.started"), ("all", "message.received"),
                     ("task", "task.done"), ("all", "task.done")]
     assert len(bus.handler_errors) == 3
+
+
+
+def test_latest_returns_the_newest_events_without_the_noisy_ones(events):
+    """The activity feed shows the newest events, however long the log (it used to stop at the 5000th)."""
+    for i in range(600):
+        events.append(ev("tool.succeeded" if i % 2 else "entity.transitioned", mission_id="m1", payload={"i": i}))
+    assert [e.payload["i"] for e in events.latest(3, mission_id="m1", exclude_prefix="tool.")] == [594, 596, 598]
+    assert [e.payload["i"] for e in events.latest(2, since_seq=597)] == [598, 599]
+    assert events.latest(2, mission_id="other") == []

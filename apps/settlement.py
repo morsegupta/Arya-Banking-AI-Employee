@@ -10,6 +10,7 @@ ERP's web form to post the receipt, and its work is checked afterwards.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
 from dataclasses import dataclass
@@ -54,8 +55,13 @@ class StatementFormatError(ValueError):
 
 
 def _amount(cell: str) -> int:
-    """'₹1,12,000.00', '112000.00', '1,12,000' -> paise."""
-    return int((Decimal(re.sub(r"[^\d.]", "", cell)) * 100).to_integral_value())
+    """'₹1,12,000.00', '112000.00', '1,12,000' -> paise. Signed: '-5,000', '(5,000)' and '5,000 Dr' are
+    negative (a reversal or a debit in the credit column), so they can never count as money received."""
+    text = cell.strip()
+    negative = text.startswith("-") or text.endswith("-") or (text.startswith("(") and text.endswith(")")) \
+        or re.search(r"\bDR\.?$", text, re.I) is not None
+    paise = int((Decimal(re.sub(r"[^\d.]", "", text)) * 100).to_integral_value())
+    return -paise if negative else paise
 
 
 def _date(cell: str, formats: str | list[str]) -> date:
@@ -80,6 +86,7 @@ def parse_rows(header: list[str], rows: list[list[str]], mapping: dict[str, Any]
     i_date, i_text, i_ref, i_credit = col("date"), col("text"), col("ref"), col("credit")
     formats = mapping["date"].get("format", "%Y-%m-%d")
     out = []
+    seen: dict[str, int] = {}
     for r in rows:
         if len(r) < len(header) or not re.search(r"\d", r[i_credit]):
             continue
@@ -87,8 +94,21 @@ def parse_rows(header: list[str], rows: list[list[str]], mapping: dict[str, Any]
             amount = _amount(r[i_credit])
         except InvalidOperation as exc:
             raise StatementFormatError(f"unreadable amount {r[i_credit]!r} in {source}") from exc
-        out.append(Record(id=r[i_ref].strip(), on=_date(r[i_date], formats), text=r[i_text].strip(), amount=amount))
+        if amount <= 0:
+            continue                    # not incoming money: a reversal or debit is never matched
+        on, text = _date(r[i_date], formats), r[i_text].strip()
+        ref = r[i_ref].strip() or _no_ref_id(on, text, amount, seen)
+        out.append(Record(id=ref, on=on, text=text, amount=amount))
     return out
+
+
+def _no_ref_id(on: date, text: str, amount: int, seen: dict[str, int]) -> str:
+    """A credit without a bank reference (cash deposit, some transfers) still needs its own id, or every
+    such credit after the first would look already applied. Same line, same id on every read of the
+    statement; identical lines on one day are told apart by their order."""
+    base = "NOREF-" + hashlib.sha256(f"{on.isoformat()}|{amount}|{' '.join(text.upper().split())}".encode()).hexdigest()[:10]
+    seen[base] = seen.get(base, 0) + 1
+    return base if seen[base] == 1 else f"{base}-{seen[base]}"
 
 
 def parse_statement(path: str, mapping: dict[str, Any]) -> list[Record]:
@@ -118,11 +138,16 @@ def ledger_applied(rt: Runtime) -> set[str]:
 def ledger_set(rt: Runtime, m: Match, status: str, receipt_id: str | None = None, source: str | None = None) -> None:
     ensure_ledger(rt)
     with rt.db.transaction() as conn:
-        conn.execute("INSERT INTO settlements (record_id, entity_id, amount, kind, status, receipt_id, record_on, "
-                     "record_text, source) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(record_id, entity_id) "
-                     "DO UPDATE SET status = excluded.status, receipt_id = COALESCE(excluded.receipt_id, receipt_id)",
-                     (m.record_id, m.entity_id, m.matched_amount, m.kind, status, receipt_id,
-                      m.record_on.isoformat(), m.record_text, source))
+        ledger_set_in(conn, m, status, receipt_id, source)
+
+
+def ledger_set_in(conn, m: Match, status: str, receipt_id: str | None = None, source: str | None = None) -> None:
+    """Same as ledger_set, inside a caller's transaction."""
+    conn.execute("INSERT INTO settlements (record_id, entity_id, amount, kind, status, receipt_id, record_on, "
+                 "record_text, source) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(record_id, entity_id) "
+                 "DO UPDATE SET status = excluded.status, receipt_id = COALESCE(excluded.receipt_id, receipt_id)",
+                 (m.record_id, m.entity_id, m.matched_amount, m.kind, status, receipt_id,
+                  m.record_on.isoformat(), m.record_text, source))
 
 
 def ledger_pending(rt: Runtime, mission_id: str) -> list[tuple[Match, str]]:
@@ -399,11 +424,13 @@ async def _carry(rt: Runtime, mission_id: str, entity: Entity, m: Match, source:
            "verifier": {"pass": report.passed}}
     balance = int(entity.data.get("balance", entity.value))
     target = "PAID" if m.matched_amount >= balance - tol else "PARTIALLY_PAID"
+    # the move, the new balance and the ledger's VERIFIED commit together: a crash can never leave one
+    # without the others (a moved entity with an old balance would fail every later verification)
     tr = rt.pipeline.propose(entity.id, target, ctx, facts={
         "settlement": {"record_id": m.record_id, "amount": m.matched_amount, "receipt_id": receipt["id"],
-                       "on": m.record_on.isoformat()}})
+                       "on": m.record_on.isoformat()}},
+        data={"balance": max(0, balance - m.matched_amount)}, also=lambda conn: ledger_set_in(conn, m, "VERIFIED"))
     if tr.ok:
-        ledger_set(rt, m, "VERIFIED")
         if rt.evidence:
             rt.evidence.collect([
                 Evidence(kind="file" if source and not source.startswith("screen:") else "record",
@@ -413,7 +440,6 @@ async def _carry(rt: Runtime, mission_id: str, entity: Entity, m: Match, source:
                                "reasons": m.reasons}),
                 Evidence(kind="record", ref=f"erp:{receipt['id']}", summary=f"receipt {receipt['id']}")],
                 subject=f"transition:{target}", mission_id=mission_id, entity_id=entity.id)
-        rt.pipeline.update_data(entity.id, {"balance": max(0, balance - m.matched_amount)})
     return Settled(entity.external_ref, m, receipt, report, tr)
 
 

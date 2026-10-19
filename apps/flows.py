@@ -238,7 +238,7 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
                     "attachments": turn.attachments, "refs": refs})
             ctx = RunContext(mission_id=mission_id, task_id=None, entity_id=loaded[0].entity.id,
                              allowed_apps={channel}, idempotency_key=f"{mission_id}:{key}:{step}:{channel}",
-                             artifacts_dir=rt.artifacts_dir, counterparty=counterparty)
+                             artifacts_dir=rt.artifacts_dir, counterparty=counterparty, attachable=documents)
             args = {"to": turn.to, "body": turn.body, "attachments": turn.attachments}
             if turn.subject:
                 args["subject"] = turn.subject

@@ -178,3 +178,28 @@ def test_promise_needs_the_verifier(pipe):
     ctx = {**PROMISE_CTX, "verifier": {"pass": False}}
     r = pipe.propose(e.id, "PROMISED", ctx, facts={"promise_amount": 340000_00, "promise_date": "2026-10-22"})
     assert not r.ok and "verifier.pass == true" in r.guard.failures()
+
+
+def test_transition_data_and_bookkeeping_commit_together(pipe, runtime_db):
+    """A move, its data change and the caller's own write are one transaction: all or nothing."""
+    runtime_db.ensure_schema("CREATE TABLE IF NOT EXISTS ledger (k TEXT PRIMARY KEY);")
+    e = contacted(pipe)
+    proof = {"matcher": {"matched_amount": 170000_00, "counterparty_matches": True, "record_id": "T1"},
+             "erp": {"receipt_exists": True}, "verifier": {"pass": True}}
+
+    def crash(conn):
+        conn.execute("INSERT INTO ledger VALUES ('T1')")
+        raise RuntimeError("power cut")
+
+    with pytest.raises(RuntimeError):
+        pipe.propose(e.id, "PARTIALLY_PAID", proof, data={"balance": 170000_00}, also=crash)
+    after = pipe.get(e.id)
+    assert after.state == "CONTACTED" and after.data["balance"] == 340000_00
+    with runtime_db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0] == 0
+
+    tr = pipe.propose(e.id, "PARTIALLY_PAID", proof, data={"balance": 170000_00},
+                      also=lambda conn: conn.execute("INSERT INTO ledger VALUES ('T1')"))
+    assert tr.ok and tr.entity.data["balance"] == 170000_00
+    with runtime_db.read() as conn:
+        assert conn.execute("SELECT k FROM ledger").fetchone()[0] == "T1"

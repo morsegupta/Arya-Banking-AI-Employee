@@ -19,7 +19,7 @@ from core.models import CriterionResult, ToolResult
 from core.pii import Tokenizer, UnknownToken
 from core.policy import PolicyGate
 from tests.fakes import ScriptedLLM
-from tools.base import RunContext, Tool, ToolRegistry
+from tools.base import PermanentToolError, RunContext, Tool, ToolRegistry
 
 IST = ZoneInfo("Asia/Kolkata")
 MON_10 = datetime(2026, 10, 19, 10, 0, tzinfo=IST)
@@ -139,6 +139,27 @@ def test_concession_waits_for_a_human_then_runs_exactly(world):
     assert Send.sent == ["We can offer a 5% discount."]
     other = send(reg, "We can offer a 10% discount.", "k1", entity="e1")      # different text: not approved
     assert not other.ok
+
+
+def test_an_approved_call_that_failed_can_be_approved_again(world, monkeypatch):
+    """Retrying a held call whose approved run failed reopens its card; it never waits on a closed one."""
+    _, broker, _, reg = world
+    real_run = Send.run
+
+    async def bounce(self, args, ctx):
+        raise PermanentToolError("bounced")
+    monkeypatch.setattr(Send, "run", bounce)
+    a = broker.get(policy_of(send(reg, "We can offer a 5% discount.", "k1", entity="e1"))["approval_id"])
+    broker.decide(a.id, approve=True, by="fm")
+    assert asyncio.run(broker.execute_approved(a.id)).status == "FAILED"
+
+    monkeypatch.setattr(Send, "run", real_run)
+    again = send(reg, "We can offer a 5% discount.", "k1", entity="e1")
+    assert policy_of(again)["policy_action"] == "ask" and policy_of(again)["approval_id"] == a.id
+    assert broker.get(a.id).status == "PENDING" and broker.get(a.id).decided_by is None
+    broker.decide(a.id, approve=True, by="fm")
+    assert asyncio.run(broker.execute_approved(a.id)).status == "EXECUTED"
+    assert Send.sent == ["We can offer a 5% discount."]
 
 
 def test_rejected_call_is_denied_and_decisions_grant_wording(world):

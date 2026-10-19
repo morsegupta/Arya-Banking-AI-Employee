@@ -106,7 +106,7 @@ class ThreadArgs(BaseModel):
 
 
 class AttachmentArgs(BaseModel):
-    message_id: str
+    message_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")    # used in a local path: an id, never "../"
     filename: str
 
 
@@ -157,8 +157,12 @@ class SendTool(_ChannelTool):
         if self.channel == "whatsapp" and args.subject:
             raise PermanentToolError("WhatsApp messages have no subject")
         attachments = []
+        offered = {self.roots.resolve(d, ctx) for d in ctx.attachable or []}
+        own = ctx.task_dir().resolve()
         for raw in args.attachments:
             path = self.roots.resolve(raw, ctx)
+            if path not in offered and not path.is_relative_to(own):
+                raise ToolDenied(f"attachment {raw} was not offered for this message")
             attachments.append({"filename": path.name, "content_type": _content_type(path),
                                 "content_b64": base64.b64encode(path.read_bytes()).decode()})
         msg = await self.client.send(channel=self.channel, **{"from": self.own_address}, to=args.to,

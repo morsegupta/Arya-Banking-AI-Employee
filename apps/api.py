@@ -8,6 +8,9 @@ run lock as the CLI, so the UI and the CLI never write over each other. Progress
 every new event in the audit log and every line the job writes.
 
 Only binds to 127.0.0.1. There is no login: this is a single-user prototype on the operator's machine.
+Two checks keep other web pages from using it through the operator's browser: the Host must be a local
+name (defeats DNS rebinding), and every request that acts must carry the X-Arya-Workspace header, which a
+cross-site page cannot add without a CORS preflight this API never grants.
 """
 
 from __future__ import annotations
@@ -22,8 +25,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -37,6 +40,17 @@ from core.models import Event, new_id
 from tools.base import RunContext
 
 UI_DIST = Path(__file__).parent / "workspace" / "dist"
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+ACTION_HEADER = "X-Arya-Workspace"
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _hostname(value: str) -> str:
+    """'127.0.0.1:8100' -> '127.0.0.1', '[::1]:8100' -> '[::1]', 'http://localhost:5173' -> 'localhost'."""
+    value = value.split("://", 1)[-1].split("/", 1)[0].lower()
+    if value.startswith("["):                       # IPv6 literal: the port follows the closing bracket
+        return value[:value.index("]") + 1]
+    return value.rsplit(":", 1)[0]
 
 
 # --- jobs ------------------------------------------------------------------------------------------
@@ -171,7 +185,8 @@ class ResumeIn(BaseModel):
 # --- app -----------------------------------------------------------------------------------------------
 
 def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Callable[[], Any] | None = None,
-               lock_dir: Path | None = None, serve_ui: bool = True) -> FastAPI:
+               lock_dir: Path | None = None, serve_ui: bool = True, ui_dir: Path = UI_DIST,
+               allowed_hosts: frozenset[str] = LOCAL_HOSTS) -> FastAPI:
     holder: dict[str, Workspace] = {}
 
     @asynccontextmanager
@@ -182,6 +197,17 @@ def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Cal
         await rt.close()
 
     app = FastAPI(title="Arya workspace", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        if _hostname(request.headers.get("host", "")) not in allowed_hosts:
+            return JSONResponse({"detail": "unknown host"}, status_code=403)
+        if request.method not in SAFE_METHODS:
+            origin = request.headers.get("origin")
+            if request.headers.get(ACTION_HEADER) != "1" or (origin and _hostname(origin) not in allowed_hosts):
+                return JSONResponse({"detail": f"actions need the {ACTION_HEADER} header from the workspace"},
+                                    status_code=403)
+        return await call_next(request)
 
     def ws() -> Workspace:
         return holder["ws"]
@@ -264,10 +290,10 @@ def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Cal
         return [{**a.model_dump(mode="json"), "ref": names.get(a.entity_id or "")} for a in reversed(items)]
 
     @app.get("/api/events")
-    def events(mission_id: str | None = None, since: int = 0, limit: int = 200):
+    def events(mission_id: str | None = None, since: int = 0, limit: int = Query(200, ge=1, le=5000)):
         names = refs()
-        evs = ws().rt.events.query(mission_id=mission_id, since_seq=since, limit=5000)
-        return [_event_json(e, names) for e in evs if not e.type.startswith("tool.")][-limit:]
+        evs = ws().rt.events.latest(limit, mission_id=mission_id, since_seq=since, exclude_prefix="tool.")
+        return [_event_json(e, names) for e in evs]
 
     @app.get("/api/jobs/{job_id}")
     def job(job_id: str):
@@ -412,13 +438,17 @@ def create_app(rt_factory: Callable[[], Runtime] | None = None, sim_factory: Cal
 
     # --- UI -------------------------------------------------------------------------------------------------
 
-    if serve_ui and UI_DIST.exists():
-        app.mount("/assets", StaticFiles(directory=UI_DIST / "assets"), name="assets")
+    if serve_ui and ui_dir.exists():
+        root = ui_dir.resolve()
+        if (root / "assets").is_dir():
+            app.mount("/assets", StaticFiles(directory=root / "assets"), name="assets")
 
         @app.get("/{path:path}", include_in_schema=False)
         def spa(path: str):
-            target = UI_DIST / path
-            return FileResponse(target if path and target.is_file() else UI_DIST / "index.html")
+            # `path` arrives URL-decoded, so "%2e%2e/" is "../": serve only files inside the build folder
+            target = (root / path).resolve()
+            inside = target == root or target.is_relative_to(root)
+            return FileResponse(target if path and inside and target.is_file() else root / "index.html")
 
     return app
 

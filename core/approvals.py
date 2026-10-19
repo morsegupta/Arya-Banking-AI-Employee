@@ -7,7 +7,8 @@ An approval is one question for a human with full context and a proposed next st
 - `decision`: a judgment the role reserves for humans (a concession, a plan, a review
   of quarantined content). The caller acts on the decision when it sees it.
 
-Requests are idempotent on `key`: asking twice for the same thing yields one approval.
+Requests are idempotent on `key`: asking twice for the same thing yields one approval. An approval
+whose approved action FAILED is reopened (PENDING again) when the same thing is asked for again.
 Only a human actor may decide. Every step is an `approval.*` event.
 """
 
@@ -92,6 +93,16 @@ class ApprovalBroker:
                 mission_id: str | None = None, entity_id: str | None = None) -> Approval:
         with self.db.transaction() as conn:
             row = conn.execute("SELECT * FROM approvals WHERE key = ?", (key,)).fetchone()
+            if row and row["status"] == "FAILED":
+                # the approved action ran and failed: asking again must reach a human, not a closed card
+                a = _row(row).model_copy(update={"status": "PENDING", "title": title, "payload": payload or {},
+                                                 "requested_at": self.clock.now(), "decided_by": None,
+                                                 "decided_at": None, "note": None, "result": None})
+                conn.execute("UPDATE approvals SET status = 'PENDING', title = ?, payload_json = ?, requested_at = ?, "
+                             "decided_by = NULL, decided_at = NULL, note = NULL, result_json = NULL WHERE id = ?",
+                             (title, json.dumps(a.payload, default=str), a.requested_at.isoformat(), a.id))
+                self._event(conn, "approval.requested", a, payload=a.payload, reopened=True)
+                return a
             if row:
                 return _row(row)
             a = Approval(id=new_id("apr"), key=key, mission_id=mission_id, entity_id=entity_id, kind=kind,

@@ -27,7 +27,7 @@ def client(servers, sandbox_var, asgi, world):  # noqa: F811
         sim_factory=lambda: SimEngine(world, "http://hub", "http://bank", hub_transport=asgi["hub"],
                                       bank_transport=asgi["bank"]),
         lock_dir=sandbox_var, serve_ui=False)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1:8100", headers={"X-Arya-Workspace": "1"}) as c:
         yield c
 
 
@@ -102,3 +102,39 @@ def test_one_job_at_a_time_and_unknown_things_are_404(client):
     second = c.post("/api/missions", json={"brief": BRIEF})
     assert second.status_code == 409 and "busy" in second.json()["detail"]
     wait(c, first)
+
+
+def test_ui_route_never_serves_files_outside_the_build(tmp_path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("index")
+    (dist / "assets" / "app.js").write_text("js")
+    (tmp_path / ".env").write_text("GROQ_API_KEY=secret")
+
+    class _Rt:
+        async def close(self):
+            pass
+
+    app = create_app(rt_factory=_Rt, ui_dir=dist)
+    with TestClient(app, base_url="http://127.0.0.1:8100") as c:
+        assert c.get("/assets/app.js").text == "js"
+        for url in ("/../.env", "/%2e%2e/.env", "/..%2f.env", "/%2e%2e%2f%2e%2e%2f.env"):
+            r = c.get(url)
+            assert "secret" not in r.text and r.text == "index", url
+
+
+def test_other_sites_cannot_drive_the_workspace():
+    """A page on another site (or a DNS-rebound name) cannot trigger actions through the operator's browser."""
+    class _Rt:
+        async def close(self):
+            pass
+
+    app = create_app(rt_factory=_Rt, serve_ui=False)
+    with TestClient(app, base_url="http://127.0.0.1:8100", raise_server_exceptions=False) as c:
+        assert c.post("/api/missions/m1/tick").status_code == 403                       # simple cross-site POST
+        assert c.post("/api/missions/m1/tick", headers={"X-Arya-Workspace": "1",
+                                                        "Origin": "https://evil.example"}).status_code == 403
+        assert c.get("/api/jobs/x", headers={"Host": "evil.example:8100"}).status_code == 403   # DNS rebinding
+        assert c.get("/api/jobs/x", headers={"Host": "localhost:5173"}).status_code == 404       # Vite dev proxy
+        assert c.post("/api/missions/m1/tick", headers={"X-Arya-Workspace": "1",
+                                                        "Origin": "http://127.0.0.1:8100"}).status_code != 403
