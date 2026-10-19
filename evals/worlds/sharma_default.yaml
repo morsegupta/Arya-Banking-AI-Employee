@@ -8,6 +8,13 @@
 # so the agent can never read them.
 
 world_id: sharma_default
+
+# How evals/ run this world: the brief a manager gives, how many days, what must hold at the end.
+eval:
+  brief: "Collect the 45+ day overdue invoices — target ₹12L by Friday."
+  days: 5
+  humans: { concession: reject }      # the manager says no to discounts each morning
+  expect: { status: "ACTIVE|COMPLETED|ESCALATED" }
 start: "2026-10-19T10:00:00+05:30"   # Monday, after contact hours open (09:30). Mission week ends Friday 2026-10-23.
 
 company:

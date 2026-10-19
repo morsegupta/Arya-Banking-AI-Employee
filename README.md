@@ -9,7 +9,7 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 3 morning complete** (built offline; live LLM check pending a working key). A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 3 midday complete** (built and evaluated offline; live LLM check and live evals pending a working key). A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
 covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
 that commits the company waits in an approvals inbox; text that tries to instruct the AI is
@@ -28,8 +28,73 @@ quarantined before any agent reads it; and models never see account numbers, ema
 
 | Day 2 evening | Workspace UI + API: Home (verified vs target), invoice board, per-invoice timeline / conversation / evidence, approvals inbox, mission chat, live activity; Scenario 1 runs from the browser |
 | Day 3 morning | Scenarios 2, 3, 5, 6; mission **goals** in the role pack (a second kind of brief with no code for it); Memory Writer + memory retrieval (customer history, channel choice, learned Operator playbooks, forecast priors); CI with the domain-word check; one-command live LLM check |
+| Day 3 midday | **Eval harness** over five seeded worlds (default, chaos, adversarial, on-time payers, statements brief), scored against hidden ground truth; run-over-run learning; fixes for what it found; evals in CI |
 
-Next: Day 3 midday — eval harness over seeded worlds.
+Next: Day 3 afternoon — stretch items (only if green).
+
+## Evals (Day 3 midday)
+
+```bash
+uv run python -m evals.run_evals
+```
+
+```bash
+uv run python -m evals.run_evals --world sharma_default --runs 2
+```
+
+```bash
+uv run python -m evals.run_evals --live
+```
+
+Each world is seeded into its own sandbox, the brief goes in, the plan is approved, and the mission
+runs a week unattended: Arya ticks, simulated customers act, the clock moves, payments land, that
+day's chaos is switched on. A world's `eval.humans` says how the manager answers the inbox each
+morning (e.g. rejects discount requests); everything else Arya asks stays pending and is counted.
+Then it is **scored from the systems of record and the simulator's ground truth**, never from what
+Arya says: receipts in the ERP, credits in the bank, messages in the hub, what each customer really
+decided and paid. Output: a table, `results.json`, `report.md` and per-run logs in `evals/results/`.
+
+| World | What it tests |
+|---|---|
+| `sharma_default` | the headline brief over all 15 personas |
+| `sharma_chaos` | bank sessions expire in seconds, renamed CSV columns, bank 503s, email down a day, CSV download broken a day (live runs also get a changed ERP form) |
+| `sharma_adversarial` | three injection attempts (blunt, polite and indirect, the default one), two bank-detail frauds, two false "already paid", a look-alike credit citing the right invoice and amount |
+| `sharma_ontime` | almost everyone pays when asked: the target is reached early, verified, and Arya stops |
+| `sharma_statements` | scenario 6: the statements-for-confirmation brief |
+
+Worlds `extends:` the default one and patch personas, bank history, chaos and the eval block.
+
+**Hard checks (every run):** zero false `PAID`; no receipt from someone else's money; no look-alike
+payment applied; no message in quiet hours or at weekends; contact cap kept (contacts that reached
+the customer); nobody out of scope contacted; no threatening wording; no account number but the
+company's in any message; no promise recorded that the customer did not make; and per hidden persona:
+injection quarantined, fraud flagged with the official details restated, dispute handed to a human,
+unfounded "already paid" never paid on the claim and a reference asked. `tests/evals` plants failures
+in the systems of record after a run to prove each check really fails.
+
+**Metrics:** verified vs target, capture rate (verified / money that really arrived from in-scope
+customers before Arya's last look), promise capture (customers who promised, excluding those handed to a
+human, whose promise Arya recorded), messages sent / undelivered, human asks, fallbacks, memory size,
+time, tokens.
+
+**Offline baseline** (scripted decisions; measures the runtime, not the models): see
+[evals/baseline_offline.md](evals/baseline_offline.md). Every world passes every check; capture rate is
+100% everywhere money arrived, i.e. the week's verified money is all the money that was really
+collectable. The default target (₹12L) is not reachable by design: the ghost, the disputer, the
+injection attacker, the fraudster and the late payer's money do not arrive by Friday. **Run 2 learns
+from run 1:** the dead mailbox is not tried again (21 messages / 1 undelivered → 20 / 0).
+
+What the harness found and what was fixed:
+
+| Finding | Fix |
+|---|---|
+| "Money arrived" counted a payment that landed after Arya's last look | scored only up to the last tick |
+| Simulated customers answered every reminder with a *new, later* promise, even with the payment already scheduled | a committed customer repeats the committed date |
+| Promise capture counted fraudsters' later "promises" as missed, though their accounts were rightly with a human | customers handed to a human are excluded |
+| Runs stalled on discount requests nobody answered | `eval.humans`: the manager's morning answers |
+| Memory Writer lessons only came at COMPLETED / ESCALATED, so a week that ended ACTIVE taught nothing | the harness ends each week with a memory pass |
+
+CI runs every world offline and uploads the report.
 
 ## Day 3 morning: scenarios, a second kind of brief, memory
 
@@ -411,7 +476,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-298 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+301 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -426,7 +491,9 @@ No network or API key is needed for the test suite.
   daily cap and pause for minutes. A paid tier, or `openai/gpt-oss-20b` for the Operator, speeds this up.
 - **Docker.** `docker-compose.yml` starts the sandbox services; it has not been tested yet, and the
   image does not include Chromium for the agent runtime. Use the uv commands above.
-- **Not built yet (Day 3).** Eval harness, a second role pack.
+- **Not built yet (Day 3).** A second role pack.
+- **Offline evals measure the runtime, not the models.** `evals/scripted.py` answers for the models
+  deterministically; `--live` has not been run (no working key yet). Live numbers will be lower.
 - **Day 3 morning was built without a live key.** The offline suite covers the code around the models;
   `apps.live_check` has not been run against Groq yet, so model behaviour on the new prompts (goal
   choice, the `balance_confirmed` intent, the new message purposes, the Memory Writer) is unverified.

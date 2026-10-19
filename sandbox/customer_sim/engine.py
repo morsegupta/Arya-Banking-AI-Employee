@@ -89,10 +89,12 @@ def business_days_after(start: date, n: int) -> date:
 
 
 class Personas:
-    def __init__(self, world: World, paid: Callable[[str], dict[str, int]] | None = None):
+    def __init__(self, world: World, paid: Callable[[str], dict[str, int]] | None = None,
+                 scheduled: Callable[[str], list[dict[str, Any]]] | None = None):
         self.world = world
         self.in_scope = set(world.ground_truth.get("in_scope_45_plus", []))
         self.paid = paid or (lambda customer_id: {})    # invoice -> paise this customer already paid (sim ledger)
+        self.scheduled = scheduled or (lambda customer_id: [])   # payments committed and not yet made
 
     def outstanding(self, invoices: list[Invoice]) -> int:
         paid = self.paid(invoices[0].customer) if invoices else {}
@@ -151,6 +153,11 @@ class Personas:
         if persona == "discount_haggler" and nth_contact == 1 and not DISCOUNT_OK.search(inbound["body"]):
             return Decision("discount_request", numbers, notes={"percent": h.get("asks_discount_percent", 5)})
 
+        # Already committed and the money is on its way: a reminder gets the same date back, not a new one.
+        committed = next((p for p in self.scheduled(customer.id) if set(p["invoices"]) & set(numbers)), None)
+        if committed and committed.get("promised_on"):
+            return Decision("promise", committed["invoices"], promise_amount_paise=committed["amount_paise"],
+                            promise_date=date.fromisoformat(committed["promised_on"]), notes={"repeat": True})
         if persona == "prompt_payer" and h.get("pays_combined_transfer"):
             invoices = [i for i in self.open_invoices(customer.id) if i.number in self.in_scope] or invoices
             numbers, total = [i.number for i in invoices], sum(i.total_paise for i in invoices)
@@ -241,7 +248,7 @@ class SimEngine:
     def __init__(self, world: World, hub_url: str, bank_url: str, *, voice: Voice | None = None,
                  hub_transport: httpx.AsyncBaseTransport | None = None,
                  bank_transport: httpx.AsyncBaseTransport | None = None):
-        self.world, self.personas = world, Personas(world, paid=self._paid)
+        self.world, self.personas = world, Personas(world, paid=self._paid, scheduled=self._scheduled)
         self.voice = voice or TemplateVoice()
         self.hub = httpx.AsyncClient(base_url=hub_url, timeout=15, transport=hub_transport,
                                      headers={"Authorization": f"Bearer {config.get('HUB_SIM_TOKEN')}"})
@@ -308,6 +315,13 @@ class SimEngine:
                              "reply": reply_id, "invoices": decision.invoices,
                              "pay_on": decision.pay_on.isoformat() if decision.pay_on else None})
         return done
+
+    @staticmethod
+    def _scheduled(customer_id: str) -> list[dict[str, Any]]:
+        with db.session(DB_NAME) as conn:
+            rows = conn.execute("SELECT * FROM payments WHERE customer_id = ? AND status = 'SCHEDULED' ORDER BY id",
+                                (customer_id,)).fetchall()
+        return [{**dict(r), "invoices": json.loads(r["invoices_json"])} for r in rows]
 
     def _paid(self, customer_id: str) -> dict[str, int]:
         """What this customer has already paid (or scheduled), spread over the invoices each payment

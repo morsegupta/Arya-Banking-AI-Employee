@@ -1,0 +1,10 @@
+# Same company, a different kind of brief (scenario 6): statements for balance confirmation.
+# No money target: every customer over ₹1L should confirm; the disputer disputes, the ghost stays
+# silent, so the mission should stay ACTIVE with most customers confirmed.
+extends: sharma_default.yaml
+world_id: sharma_statements
+
+eval:
+  brief: "Send statements of account to all customers over ₹1L outstanding and get confirmations."
+  days: 4
+  expect: { status: "ACTIVE|COMPLETED" }

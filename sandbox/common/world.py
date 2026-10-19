@@ -113,6 +113,12 @@ class World(BaseModel):
     invoices: list[Invoice]
     bank_transactions: list[BankTxn]
     ground_truth: dict[str, Any] = Field(default_factory=dict)
+    # Sandbox misbehaviour (sandbox.chaos switches): set at seed time, and per day of an eval run.
+    # `live_only` switches need a live model to cope (e.g. a changed ERP form); offline evals skip them.
+    chaos: dict[str, Any] = Field(default_factory=dict)
+    chaos_by_day: dict[int, dict[str, Any]] = Field(default_factory=dict)
+    live_only_chaos: dict[str, Any] = Field(default_factory=dict)
+    eval: dict[str, Any] = Field(default_factory=dict)      # brief, days, expectations for evals/
 
     @model_validator(mode="after")
     def references_resolve(self) -> "World":
@@ -134,9 +140,38 @@ class World(BaseModel):
         return inv.issue_date + timedelta(days=self.customer(inv.customer).payment_terms_days)
 
 
+def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def world_data(path: Path | str) -> dict[str, Any]:
+    """A world file, resolved. A world may `extends: <file>` another (relative path) and then:
+        customers_patch: {C01: {...}}     deep-merged into those customers (e.g. a different persona)
+        bank_transactions_add: [...]      appended to the base world's bank history
+    and any top-level key (chaos, eval, ground_truth...) is deep-merged over the base."""
+    path = Path(path)
+    data = yaml.safe_load(path.read_text())
+    if "extends" in data:
+        base = world_data(path.parent / data.pop("extends"))
+        patch = data.pop("customers_patch", {}) or {}
+        extra = data.pop("bank_transactions_add", []) or []
+        unknown = set(patch) - {c["id"] for c in base["customers"]}
+        if unknown:
+            raise ValueError(f"customers_patch names unknown customers {sorted(unknown)}")
+        base["customers"] = [_merge(c, patch.get(c["id"], {})) for c in base["customers"]]
+        base["bank_transactions"] = [*base["bank_transactions"], *extra]
+        for key in ("eval", "chaos", "chaos_by_day", "live_only_chaos"):
+            if key in data:
+                base[key] = {}                       # these describe one world: replaced, not inherited
+        data = _merge(base, data)
+    return data
+
+
 def load_world(path: Path | str = DEFAULT_WORLD) -> World:
-    with open(path) as fh:
-        return World.model_validate(yaml.safe_load(fh))
+    return World.model_validate(world_data(path))
 
 
 # --- invoice line items -----------------------------------------------------

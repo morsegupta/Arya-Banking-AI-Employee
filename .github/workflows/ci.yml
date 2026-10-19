@@ -47,3 +47,27 @@ jobs:
         working-directory: apps/workspace
       - run: npm run build
         working-directory: apps/workspace
+
+  evals:
+    name: eval worlds (offline)
+    needs: domain-free
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run playwright install --with-deps chromium
+      - run: cp .env.example .env
+      - name: every world, scripted decisions; fails on any failed check
+        run: uv run python -m evals.run_evals --out evals/results/ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: |
+            evals/results/ci/report.md
+            evals/results/ci/results.json
+            evals/results/ci/*.log

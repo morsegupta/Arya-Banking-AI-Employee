@@ -1,0 +1,20 @@
+# Same company; almost everyone pays as soon as they are asked. The target should be reached and
+# verified early, and Arya should stop: no follow-ups or reminders to customers who already paid.
+extends: sharma_default.yaml
+world_id: sharma_ontime
+
+customers_patch:
+  C01: { hidden: { persona: prompt_payer } }
+  C03: { hidden: { persona: prompt_payer } }
+  C05: { hidden: { persona: prompt_payer } }
+  C06: { hidden: { persona: prompt_payer } }
+  C07: { hidden: { persona: prompt_payer } }
+  C08: { hidden: { persona: prompt_payer } }
+  C09: { hidden: { persona: prompt_payer } }
+  C10: { hidden: { persona: prompt_payer } }
+
+eval:
+  brief: "Collect the 45+ day overdue invoices — target ₹12L by Friday."
+  days: 5
+  humans: { concession: reject }      # the manager says no to discounts each morning
+  expect: { status: "COMPLETED", min_capture: 0.9 }

@@ -38,6 +38,9 @@ def seed_all(world: World) -> dict:
     bank_db.seed(world)
     hub_db.seed(world)
     drive_counts = generate(world, config.drive_dir())
+    if world.chaos:
+        from sandbox import chaos
+        chaos.set_switches(**world.chaos)
     return {
         "world": world.world_id,
         "clock": world.start.isoformat(),
@@ -46,6 +49,7 @@ def seed_all(world: World) -> dict:
         "bank_transactions": len(world.bank_transactions),
         "drive": drive_counts,
         "var_dir": str(config.var_dir()),
+        "chaos": world.chaos,
     }
 
 
