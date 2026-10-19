@@ -180,3 +180,22 @@ def test_haggler_promises_after_discount_answer(world):
     first = p.decide(c, {"body": "INV-2293 overdue"}, 1, date(2026, 10, 19))
     second = p.decide(c, {"body": "Sorry, no discount is possible on INV-2293."}, 2, date(2026, 10, 19))
     assert first.kind == "discount_request" and second.kind == "promise" and second.pay_on
+
+
+def test_email_draft_without_subject_gets_a_code_made_one(make_runtime, asgi):
+    """Live, gpt-oss sometimes returned an email draft with no subject; the email was dropped for WhatsApp."""
+    import asyncio
+    import json
+
+    from apps.flows import outreach
+    from tests.fakes import ScriptedLLM
+
+    def draft(messages):
+        p = json.loads(messages[1]["content"])
+        return {"subject": None, "body": "Please share a payment date.", "attachments": p["AVAILABLE_DOCUMENTS"],
+                "facts_used": []}
+    rt = make_runtime(ScriptedLLM([draft] * 3))
+    out = asyncio.run(outreach(rt, "mis_s", "INV-2291"))
+    asyncio.run(rt.close())
+    assert out.ok and out.channel == "email", out.attempts
+    assert out.message["subject"] == "Sharma Distributors Pvt Ltd: invoice INV-2291"

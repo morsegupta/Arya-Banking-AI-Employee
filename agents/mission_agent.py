@@ -21,7 +21,8 @@ Domain knowledge (what a lever means, what an approach is) arrives from the role
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, time
+import re
+from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -42,7 +43,11 @@ Return:
 - objective: one sentence
 - goal: the one key of GOALS this brief asks for
 - scope: human-readable rule for which entities are in scope (mention exclusions the POLICY requires)
-- target_text: the target exactly as written in the brief (e.g. "12L", "₹5,00,000"), or null if none
+- target_text: the target exactly as written in the brief (e.g. "12L", "₹5,00,000"), or null if the brief
+  sets no amount to reach. An amount that only limits WHICH entities are in scope (e.g. "customers over
+  ₹1L") is a selection value, not a target.
+- deadline_text: the deadline exactly as written in the brief (e.g. "by Friday", "end of month",
+  "30 Oct"), or null
 - deadline: YYYY-MM-DD resolved from the brief using TODAY (weekday names mean the next such day,
   "end of week" means Friday), or null
 - selection: values for SELECTION_PARAMS that implement the scope (only these keys; a "money" parameter
@@ -79,6 +84,7 @@ class Understanding(BaseModel):
     goal: str | None = None
     scope: str
     target_text: str | None = None
+    deadline_text: str | None = None
     deadline: str | None = None
     selection: dict[str, Any] = Field(default_factory=dict)
     success_criteria: list[str] = Field(default_factory=list)
@@ -123,6 +129,32 @@ role guidance says. If the data does not answer the question, say so plainly. Ne
 you report, the manager decides.
 Return: answer (2-6 sentences, plain text), refs (entity refs you mention), groups (group ids you
 mention), confidence (0..1)."""
+
+
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def resolve_relative_date(text: str | None, today: date) -> date | None:
+    """Dates people write in briefs, resolved by code: weekday names (the next such day; a week ahead
+    when it is that day already), "end of (the) week" (Friday), "today", "tomorrow", "end of (the) month". Anything else
+    (an explicit date) is left to the model's reading, still checked against TODAY."""
+    if not text:
+        return None
+    t = text.lower()
+    if "tomorrow" in t:
+        return today + timedelta(days=1)
+    if "today" in t or "eod" in t or "end of day" in t:
+        return today
+    if "end of" in t and "month" in t:
+        nxt = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return nxt - timedelta(days=1)
+    if "end of" in t and "week" in t:
+        t = "friday"
+    hits = [i for i, name in enumerate(_WEEKDAYS) if re.search(rf"\b{name}\b|\b{name[:3]}\b", t)]
+    if len(hits) == 1:
+        ahead = (hits[0] - today.weekday()) % 7
+        return today + timedelta(days=ahead or 7)        # "by Monday", said on a Monday, means next Monday
+    return None
 
 
 class MissionAgent:
@@ -172,6 +204,12 @@ class MissionAgent:
                 if target is None:
                     problems.append(f"could not parse target {u.target_text!r}")
         deadline = None
+        resolved = resolve_relative_date(u.deadline_text, today) if u.deadline_text and \
+            u.deadline_text.strip().lower() in brief.lower() else None
+        if resolved and u.deadline != resolved.isoformat():
+            if u.deadline:
+                problems.append(f"deadline {u.deadline} does not match {u.deadline_text!r}; using {resolved}")
+            u.deadline = resolved.isoformat()
         if u.deadline:
             try:
                 d = date.fromisoformat(u.deadline)
@@ -203,6 +241,11 @@ class MissionAgent:
                 selection[key] = _CASTS[spec.get("type", "string")](value)
             except (TypeError, ValueError):
                 problems.append(f"selection {key}={value!r} is not a {spec.get('type')}; dropped")
+        thresholds = {str(v).strip().lower() for k, v in u.selection.items()
+                      if selection_params.get(k, {}).get("type") == "money"}
+        if target is not None and u.target_text and u.target_text.strip().lower() in thresholds:
+            problems.append(f"{u.target_text!r} limits the scope; it is not a target")
+            target = None
         spec = MissionSpec(objective=u.objective, goal=goal, scope=u.scope, target_value=target,
                            target_unit=self.value_unit if target is not None else None, deadline=deadline,
                            success_criteria=u.success_criteria, assumptions=u.assumptions,
@@ -305,6 +348,9 @@ class MissionAgent:
         payload = {"SPEC": spec.model_dump(mode="json"), "TODAY": f"{today.isoformat()} ({today:%A})",
                    "PROGRESS": progress, "GROUPS": groups,
                    "LEVERS": {k: v.get("description", "")
+                              + (f" Only for groups with an entity in state {', '.join(v['states'])}."
+                                 if v.get("states") else "")
+                              + (" Needs a human's approval." if v.get("needs_approval") else "")
                               + (f" Only when the group's last contact was at least {v['min_days_since_contact']} "
                                  f"day(s) ago." if v.get("min_days_since_contact") else "")
                               + (f" Only for groups where {v['requires']} is true." if v.get("requires") else "")

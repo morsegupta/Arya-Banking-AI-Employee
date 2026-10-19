@@ -209,3 +209,23 @@ def test_retry_only_for_groups_whose_first_contact_failed():
                                                                                  groups=["A", "B"])]),
                                 groups=groups, levers=levers)
     assert d.actions[0].groups == ["A"] and "does not have first_contact_failed" in d.problems[0]
+
+
+def test_deadline_words_are_resolved_by_code_not_the_model():
+    from datetime import date
+
+    from agents.mission_agent import MissionAgent, Understanding
+    agent = MissionAgent(None, minor_units=100, value_unit="paise", tz="Asia/Kolkata")
+    params = {"min_days_overdue": {"type": "integer"}, "min_group_value": {"type": "money", "scope": "group"}}
+    # live, gpt-oss read "by Friday" on Monday 19 Oct as Thursday 22 Oct
+    u = agent.check_understanding(Understanding(objective="o", scope="s", target_text="₹12L", deadline_text="by Friday",
+                                                deadline="2026-10-22"),
+                                  brief="Collect the 45+ day overdue invoices — target ₹12L by Friday.",
+                                  today=date(2026, 10, 19), selection_params=params)
+    assert u.spec.deadline.date() == date(2026, 10, 23) and any("does not match" in p for p in u.problems)
+    # live, it also took a scope threshold as the target
+    u = agent.check_understanding(Understanding(objective="o", scope="s", target_text="₹1L",
+                                                selection={"min_group_value": "₹1L"}),
+                                  brief="Send statements of account to all customers over ₹1L outstanding.",
+                                  today=date(2026, 10, 19), selection_params=params)
+    assert u.spec.target_value is None and u.selection == {"min_group_value": 1_00_000_00}

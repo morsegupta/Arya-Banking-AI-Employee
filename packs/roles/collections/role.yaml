@@ -124,6 +124,7 @@ entity_source:
 outreach:
   purpose: "First reminder for an overdue invoice: ask the customer for a payment date."
   channel_order: [email, whatsapp]
+  email_subject: "{company}: invoice {refs}"   # used only when an email draft comes back without a subject
   max_follow_ups: 2               # after this many unanswered follow-ups: NO_RESPONSE (then a human)
   # Messages the orchestrator sends on events. A mission goal may override any of them (goals.*.purposes).
   purposes:

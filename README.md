@@ -9,7 +9,7 @@ so the same runtime can run other jobs. Design and decisions: [architecture.md](
 
 ## Status
 
-**Day 3 afternoon complete** (built and evaluated offline; live LLM check and live evals pending a working key). A one-line brief becomes a checked mission spec, a policy-filtered scope,
+**Day 3 afternoon complete**, checked against the live models (Groq): live check 13/13, and a live eval world that passes every check. A one-line brief becomes a checked mission spec, a policy-filtered scope,
 a ranked plan that waits for human approval, and daily batches of outreach (one message per customer
 covering all their overdue invoices). Every action now passes a deterministic Policy Gate; anything
 that commits the company waits in an approvals inbox; text that tries to instruct the AI is
@@ -138,6 +138,20 @@ What the harness found and what was fixed:
 | Memory Writer lessons only came at COMPLETED / ESCALATED, so a week that ended ACTIVE taught nothing | the harness ends each week with a memory pass |
 
 CI runs every world offline and uploads the report.
+
+**Live (Groq, real models):** `apps.live_check` passes 13/13 after two fixes, and `sharma_default` run
+live for 2 sandbox days ([evals/baseline_live.md](evals/baseline_live.md)) passes every check: ₹3.63L
+verified, zero false `PAID`, 100% capture and promise capture, dispute / injection / fraud handled,
+51 LLM calls, 65k tokens, about 10 minutes (mostly waiting on Groq's free-tier token-per-minute limit).
+
+What the live models got wrong, and the code fix (each with an offline regression test):
+
+| Live finding | Fix |
+|---|---|
+| "by Friday", read on Monday 19 Oct, became Thursday 22 Oct | the model quotes `deadline_text`; code resolves weekday words, "end of week / month", "tomorrow" |
+| "customers over ₹1L" also taken as a ₹1L money target | an amount used as a selection threshold is never the target |
+| Daily review proposed payment plans for customers not eligible (code dropped them) | lever descriptions now state the states they apply to and whether a human approves |
+| Two email drafts came back without a subject and were dropped for WhatsApp | a code-made subject from the role pack (`outreach.email_subject`); the body is kept |
 
 ## Day 3 morning: scenarios, a second kind of brief, memory
 
@@ -520,7 +534,7 @@ uv run python -m sandbox.chaos set|show|clear                    # make the sand
 make test
 ```
 
-306 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
+308 tests: unit tests, in-process integration over the sandbox, live Chromium against real ERP and
 bank servers, and two offline acceptance tests that run the real Operator loop, browser, systems,
 simulator, matcher, verifier and guards with scripted LLM decisions:
 `tests/apps/test_end_to_end.py` (one invoice, Day 1) and `tests/apps/test_mission_week.py` (a whole
@@ -539,10 +553,9 @@ No network or API key is needed for the test suite.
   on someone's desktop waits for a person (see above).
 - The second role pack is a sketch: it runs on the core in tests, not end to end (no sandbox for it).
 - **Offline evals measure the runtime, not the models.** `evals/scripted.py` answers for the models
-  deterministically; `--live` has not been run (no working key yet). Live numbers will be lower.
-- **Day 3 morning was built without a live key.** The offline suite covers the code around the models;
-  `apps.live_check` has not been run against Groq yet, so model behaviour on the new prompts (goal
-  choice, the `balance_confirmed` intent, the new message purposes, the Memory Writer) is unverified.
+  deterministically; see the live numbers above for the models themselves.
+- **Live coverage is thin.** One live eval world for 2 sandbox days plus the live check; the other worlds
+  and full weeks have only run offline (Groq free-tier limits make a live week take about half an hour).
 - A balance confirmation is all-or-nothing per customer: a reply that confirms some invoices and
   disputes another is classified as one intent (the dispute wins only if the classifier says so).
 - The simulator recognises what Arya asked for with keyword patterns (confirm the balance, UTR,

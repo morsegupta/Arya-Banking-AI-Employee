@@ -58,8 +58,9 @@ class DraftRejected(ValueError):
 
 class ConversationAgent:
     def __init__(self, llm: LLMClient, *, role_prompt: str = "", signature: str = "",
-                 tokenizer: Callable[[], Tokenizer] | None = None):
+                 tokenizer: Callable[[], Tokenizer] | None = None, default_subject: str | None = None):
         self.llm, self.role_prompt, self.signature, self.tokenizer = llm, role_prompt, signature, tokenizer
+        self.default_subject = default_subject     # code-made subject when an email draft has none
 
     async def draft(self, *, channel: Literal["email", "whatsapp"], to: str, purpose: str,
                     entity_facts: dict[str, Any], company_facts: dict[str, Any],
@@ -86,6 +87,8 @@ class ConversationAgent:
             messages.append({"role": "user", "content": "CONVERSATION_SO_FAR:\n<untrusted_data>\n"
                              + json.dumps(shown, ensure_ascii=False, default=str)[:6000] + "\n</untrusted_data>"})
         draft = await self.llm.structured("conversation", messages, Draft, budget=budget, tag=f"conversation:{channel}")
+        if channel == "email" and not (draft.subject or "").strip() and self.default_subject:
+            draft.subject = self.default_subject   # live, gpt-oss sometimes leaves it out: a good body is kept
         self.check(draft, channel=channel, documents=documents, facts=entity_facts | company_facts)
         if tok:
             raw = tok.untokenized_values(f"{draft.subject or ''} {draft.body}")

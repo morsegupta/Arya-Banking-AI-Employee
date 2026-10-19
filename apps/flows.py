@@ -195,8 +195,12 @@ async def outreach(rt: Runtime, mission_id: str, external_ref: str | list[str], 
     contact = loaded[0].contact
     if any(item.contact != contact for item in loaded[1:]):
         raise ValueError(f"one message can only cover one counterparty: {refs}")
+    subject = cfg.get("email_subject")
     agent = ConversationAgent(rt.llm, role_prompt=role_prompt(rt, "conversation"),
-                              signature=rt.company_cfg["channels"].get("signature", ""), tokenizer=rt.tokenizer)
+                              signature=rt.company_cfg["channels"].get("signature", ""), tokenizer=rt.tokenizer,
+                              default_subject=subject.format(refs=", ".join(refs),
+                                                             company=rt.company_cfg.get("display_name", ""))
+                              if subject else None)
     facts, cfacts = {**group_facts(rt, loaded), **(extra_facts or {})}, company_facts(rt)
     documents = [d for item in loaded for d in item.documents] + list(extra_documents or [])
     entities = [item.entity for item in loaded]
